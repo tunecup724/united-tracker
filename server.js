@@ -12,10 +12,10 @@ const PORT = process.env.PORT || 3000;
 const FA_KEY = '7s7aNdZg9AzDzG3QA5oJ0GdpaCpjjTdt';
 const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
+// Reduced to top 15 hubs to stay within rate limits
 const AIRPORTS = [
   'KORD','KEWR','KIAH','KDEN','KSFO','KLAX','KIAD','KMIA','KBOS','KSEA',
-  'KATL','KDFW','KPHX','KMCO','KSLC','KSAN','KDCA','KTPA','KAUS','KBNA',
-  'KLAS','KMSP','KPDX','KCLT','KRDU','KSTL','KMCI','KIND','KCMH','KPIT'
+  'KATL','KDFW','KPHX','KMCO','KSLC'
 ];
 
 function fmtTime(isoStr, timezone) {
@@ -32,7 +32,7 @@ async function fetchAirportDepartures(airport) {
   try {
     const r = await axios.get(`${FA_URL}/airports/${airport}/flights`, {
       headers: { 'x-apikey': FA_KEY },
-      params: { max_pages: 4 },
+      params: { max_pages: 2 },
       timeout: 15000
     });
     return { airport, flights: r.data?.scheduled_departures || r.data?.departures || [], error: null };
@@ -47,14 +47,12 @@ app.get('/api/delays', async (req, res) => {
     const allFlights = [];
     const errors = [];
 
-    for (let i = 0; i < AIRPORTS.length; i += 2) {
-      const batch = AIRPORTS.slice(i, i + 2);
-      const results = await Promise.all(batch.map(ap => fetchAirportDepartures(ap)));
-      results.forEach(r => {
-        allFlights.push(...r.flights);
-        if (r.error) errors.push(`${r.airport}: ${r.error}`);
-      });
-      if (i + 2 < AIRPORTS.length) await new Promise(r => setTimeout(r, 500));
+    // One airport at a time with delay between each - respects rate limits
+    for (const airport of AIRPORTS) {
+      const result = await fetchAirportDepartures(airport);
+      allFlights.push(...result.flights);
+      if (result.error) errors.push(`${result.airport}: ${result.error}`);
+      await new Promise(r => setTimeout(r, 1000)); // 1 second between each call
     }
 
     const filtered = allFlights
