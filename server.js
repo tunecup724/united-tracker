@@ -22,6 +22,12 @@ function fmtTime(isoStr, timezone) {
   } catch { return '—'; }
 }
 
+function fmtDur(mins) {
+  if (!mins) return '—';
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
 app.get('/api/test', async (req, res) => {
   try {
     const response = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
@@ -29,9 +35,21 @@ app.get('/api/test', async (req, res) => {
       params: { max_pages: 1 },
       timeout: 15000
     });
-    res.json({ success: true, status: response.status, data: response.data });
+    const flights = response.data.flights || [];
+    const delays = flights.slice(0, 20).map(f => ({
+      ident: f.ident_iata || f.ident,
+      dep: f.origin?.code_iata,
+      arr: f.destination?.code_iata,
+      departure_delay: f.departure_delay,
+      arrival_delay: f.arrival_delay,
+      status: f.status,
+      actual_off: f.actual_off,
+      estimated_off: f.estimated_off,
+      scheduled_out: f.scheduled_out
+    }));
+    res.json({ total: flights.length, delays });
   } catch(e) {
-    res.json({ success: false, error: e.message, status: e.response?.status, details: e.response?.data });
+    res.json({ error: e.message, details: e.response?.data });
   }
 });
 
