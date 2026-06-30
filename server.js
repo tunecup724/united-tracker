@@ -22,35 +22,46 @@ function fmtTime(isoStr, timezone) {
   } catch { return '—'; }
 }
 
-function fmtDur(mins) {
-  if (!mins) return '—';
-  const h = Math.floor(mins / 60), m = mins % 60;
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
-
+// Test different endpoints to find what works
 app.get('/api/test', async (req, res) => {
+  const results = {};
+
+  // Test 1: Search for delayed UA flights
   try {
-    const response = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
+    const r = await axios.get(`${FA_URL}/flights/search`, {
+      headers: { 'x-apikey': FA_KEY },
+      params: { query: '-airline UAL -delayed true', max_pages: 1 },
+      timeout: 10000
+    });
+    results.search = { status: r.status, count: r.data?.flights?.length, sample: r.data?.flights?.slice(0,2) };
+  } catch(e) {
+    results.search = { error: e.message, status: e.response?.status, details: e.response?.data };
+  }
+
+  // Test 2: ORD scheduled departures
+  try {
+    const r = await axios.get(`${FA_URL}/airports/KORD/flights/scheduled_departures`, {
       headers: { 'x-apikey': FA_KEY },
       params: { max_pages: 1 },
-      timeout: 15000
+      timeout: 10000
     });
-    const flights = response.data.flights || [];
-    const delays = flights.slice(0, 20).map(f => ({
-      ident: f.ident_iata || f.ident,
-      dep: f.origin?.code_iata,
-      arr: f.destination?.code_iata,
-      departure_delay: f.departure_delay,
-      arrival_delay: f.arrival_delay,
-      status: f.status,
-      actual_off: f.actual_off,
-      estimated_off: f.estimated_off,
-      scheduled_out: f.scheduled_out
-    }));
-    res.json({ total: flights.length, delays });
+    results.airport = { status: r.status, count: r.data?.departures?.length, sample: r.data?.departures?.slice(0,2) };
   } catch(e) {
-    res.json({ error: e.message, details: e.response?.data });
+    results.airport = { error: e.message, status: e.response?.status, details: e.response?.data };
   }
+
+  // Test 3: UA specific flight
+  try {
+    const r = await axios.get(`${FA_URL}/flights/UAL587`, {
+      headers: { 'x-apikey': FA_KEY },
+      timeout: 10000
+    });
+    results.flight = { status: r.status, count: r.data?.flights?.length, sample: r.data?.flights?.slice(0,1) };
+  } catch(e) {
+    results.flight = { error: e.message, status: e.response?.status, details: e.response?.data };
+  }
+
+  res.json(results);
 });
 
 app.get('/api/delays', async (req, res) => {
@@ -60,10 +71,8 @@ app.get('/api/delays', async (req, res) => {
       params: { max_pages: 5 },
       timeout: 15000
     });
-
     const flights = response.data.flights || [];
     const now = new Date();
-
     const filtered = flights
       .filter(f => {
         const depDelay = f.departure_delay || 0;
@@ -110,7 +119,6 @@ app.get('/api/delays', async (req, res) => {
         const r = { high: 0, med: 1, low: 2 };
         return r[a.risk] - r[b.risk] || b.depDelay - a.depDelay;
       });
-
     res.json({ success: true, data: filtered, total: flights.length, timestamp: new Date().toISOString() });
   } catch(e) {
     res.json({ success: false, error: e.message, details: e.response?.data });
