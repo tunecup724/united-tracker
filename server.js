@@ -32,10 +32,9 @@ async function fetchAirportDepartures(airport) {
   try {
     const r = await axios.get(`${FA_URL}/airports/${airport}/flights`, {
       headers: { 'x-apikey': FA_KEY },
-      params: { max_pages: 1 },
-      timeout: 10000
+      params: { max_pages: 4 },
+      timeout: 15000
     });
-    // Use scheduled_departures for upcoming flights
     return r.data?.scheduled_departures || r.data?.departures || [];
   } catch(e) {
     console.warn(`Failed ${airport}:`, e.message);
@@ -47,16 +46,15 @@ app.get('/api/test', async (req, res) => {
   try {
     const r = await axios.get(`${FA_URL}/airports/KORD/flights`, {
       headers: { 'x-apikey': FA_KEY },
-      params: { max_pages: 1 },
-      timeout: 10000
+      params: { max_pages: 4 },
+      timeout: 15000
     });
     const deps = r.data?.scheduled_departures || [];
-    // Show UA flights only
-    const ua = deps.filter(f => f.operator_iata === 'UA').slice(0, 3);
-    const all = deps.slice(0, 2);
+    const ua = deps.filter(f => f.operator_iata === 'UA');
     res.json({ 
       total_scheduled_departures: deps.length,
-      ua_flights: ua.map(f => ({
+      ua_count: ua.length,
+      ua_flights: ua.slice(0, 5).map(f => ({
         ident: f.ident_iata,
         dep: f.origin?.code_iata,
         arr: f.destination?.code_iata,
@@ -66,8 +64,7 @@ app.get('/api/test', async (req, res) => {
         estimated_off: f.estimated_off,
         scheduled_out: f.scheduled_out,
         scheduled_in: f.scheduled_in
-      })),
-      sample_all: all.map(f => ({ ident: f.ident_iata, operator: f.operator_iata, delay: f.departure_delay }))
+      }))
     });
   } catch(e) {
     res.json({ error: e.message, details: e.response?.data });
@@ -79,18 +76,18 @@ app.get('/api/delays', async (req, res) => {
     const now = new Date();
     const allFlights = [];
 
-    for (let i = 0; i < AIRPORTS.length; i += 5) {
-      const batch = AIRPORTS.slice(i, i + 5);
+    for (let i = 0; i < AIRPORTS.length; i += 3) {
+      const batch = AIRPORTS.slice(i, i + 3);
       const results = await Promise.all(batch.map(ap => fetchAirportDepartures(ap)));
       results.forEach(flights => allFlights.push(...flights));
-      if (i + 5 < AIRPORTS.length) await new Promise(r => setTimeout(r, 300));
+      if (i + 3 < AIRPORTS.length) await new Promise(r => setTimeout(r, 300));
     }
 
     const filtered = allFlights
       .filter(f => {
         if (f.operator_iata !== 'UA') return false;
         const depDelay = f.departure_delay || 0;
-        if (depDelay < 1800) return false; // 30 mins in seconds
+        if (depDelay < 1800) return false;
         if (f.actual_off) return false;
         const estDep = f.estimated_off || f.estimated_out || f.scheduled_out;
         if (!estDep || new Date(estDep) <= now) return false;
@@ -131,12 +128,7 @@ app.get('/api/delays', async (req, res) => {
         return r[a.risk] - r[b.risk] || b.depDelay - a.depDelay;
       });
 
-    res.json({ 
-      success: true, 
-      data: filtered, 
-      total: allFlights.length,
-      timestamp: new Date().toISOString() 
-    });
+    res.json({ success: true, data: filtered, total: allFlights.length, timestamp: new Date().toISOString() });
   } catch(e) {
     res.json({ success: false, error: e.message });
   }
