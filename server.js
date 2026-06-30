@@ -9,71 +9,94 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
-const AIRLABS_KEY = '09cc4e64-99be-4e97-b1a6-6c7c8106475a';
+const FA_KEY = '7s7aNdZg9AzDzG3QA5oJ0GdpaCpjjTdt';
+const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
-const US_AIRPORTS = new Set([
-  'ORD','EWR','IAH','DEN','SFO','LAX','IAD','MIA','BOS','SEA',
-  'ATL','DFW','PHX','MCO','SLC','SAN','DCA','TPA','AUS','BNA',
-  'LAS','MSP','PDX','CLT','RDU','STL','MCI','IND','CMH','PIT',
-  'BUF','CLE','CVG','DAY','DTW','GRR','MKE','PHL','RIC','ROC',
-  'SYR','ALB','BDL','ABQ','ELP','OKC','TUL','SAT','HOU','DAL',
-  'ICT','OMA','DSM','BZN','BIL','GEG','BOI','JAC','COS','ASE',
-  'CKB','HDN','MTJ','DRO','GJT','PUB','SGU','PIH','IDA','TWF',
-  'CPR','RKS','LWS','SMF','OAK','SJC','BUR','LGB','SNA','ONT',
-  'PSP','FAT','RNO','HNL','OGG','KOA','ITO','LIH','ANC','FAI',
-  'JNU','SIT','KTN','TRI','CHA','MEM','AVL','GSP','CAE','AGS',
-  'SAV','JAX','TLH','PNS','VPS','ECP','SFB','RSW','PIE','SRQ',
-  'PBI','FLL','EYW','GNV','DAB','MLB','PHF','ORF','ROA','LYH',
-  'SBY','MDT','ABE','AVP','IPT','ERI','ITH','ELM','BGM','PLN',
-  'MQT','IMT','ESC','SGF','JLN','FOE','MHK','SLN','LBF','GRI',
-  'LNK','SUX','FSD','ABR','MOT','DIK','ISN','GFK','FAR','DLH',
-  'LSE','RST','STC','HIB','INL'
-]);
-
-function fmtTime(str) {
-  if (!str) return '—';
+function fmtTime(isoStr, timezone) {
+  if (!isoStr) return '—';
   try {
-    const timePart = str.slice(11, 16);
-    const [h, m] = timePart.split(':').map(Number);
-    const ampm = h >= 12 ? 'PM' : 'AM';
-    const h12 = h % 12 || 12;
-    return `${h12}:${m.toString().padStart(2,'0')} ${ampm}`;
+    return new Date(isoStr).toLocaleTimeString('en-US', {
+      hour: '2-digit', minute: '2-digit', hour12: true,
+      timeZone: timezone || 'America/New_York'
+    });
   } catch { return '—'; }
+}
+
+function fmtDur(mins) {
+  if (!mins) return '—';
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
 app.get('/api/delays', async (req, res) => {
   try {
-    const url = `https://airlabs.co/api/v9/delays?api_key=${AIRLABS_KEY}&type=departures&airline_iata=UA&delay=30`;
-    const response = await axios.get(url, { timeout: 15000 });
-    const data = response.data;
-    if (data.error) return res.json({ success: false, error: data.error });
+    // Get all scheduled United departures
+    const response = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
+      headers: { 'x-apikey': FA_KEY },
+      params: { max_pages: 5 },
+      timeout: 15000
+    });
 
-    const raw = data.response || [];
+    const flights = response.data.flights || [];
+    const now = new Date();
 
-    const filtered = raw
+    const filtered = flights
       .filter(f => {
-        const dur = f.duration;
-        const depDelay = f.dep_delayed || 0;
-        const isUS = US_AIRPORTS.has(f.dep_iata) && US_AIRPORTS.has(f.arr_iata);
-        // Only exclude flights that have actually departed or landed
-        const notDeparted = !f.dep_actual && !['landed','diverted','cancelled'].includes((f.status || '').toLowerCase());
-        return dur && dur <= 120 && depDelay >= 30 && isUS && notDeparted;
+        // Must have departure delay of 30+ mins
+        const depDelay = f.departure_delay || 0;
+        if (depDelay < 1800) return false; // FlightAware delay is in seconds
+
+        // Must not have actually departed yet
+        if (f.actual_off) return false;
+
+        // Estimated departure must be in the future
+        const estDep = f.estimated_off || f.scheduled_out;
+        if (!estDep) return false;
+        if (new Date(estDep) <= now) return false;
+
+        // Duration must be <= 2 hours
+        const schedOut = f.scheduled_out;
+        const schedIn = f.scheduled_in;
+        if (!schedOut || !schedIn) return false;
+        const durMins = (new Date(schedIn) - new Date(schedOut)) / 60000;
+        if (durMins > 120) return false;
+
+        return true;
       })
       .map(f => {
-        const depDelay = f.dep_delayed || 0;
-        const arrDelay = f.arr_delayed || 0;
+        const tz = f.origin?.timezone || 'America/New_York';
+        const depDelaySecs = f.departure_delay || 0;
+        const arrDelaySecs = f.arrival_delay || 0;
+        const depDelayMins = Math.round(depDelaySecs / 60);
+        const arrDelayMins = Math.round(arrDelaySecs / 60);
+
+        const schedOut = f.scheduled_out;
+        const schedIn = f.scheduled_in;
+        const durMins = schedOut && schedIn
+          ? Math.round((new Date(schedIn) - new Date(schedOut)) / 60000)
+          : null;
+
         let risk;
-        if (depDelay >= 90 || arrDelay >= 60) risk = 'high';
-        else if (depDelay >= 45 || arrDelay >= 25) risk = 'med';
+        if (depDelayMins >= 90 || arrDelayMins >= 60) risk = 'high';
+        else if (depDelayMins >= 45 || arrDelayMins >= 25) risk = 'med';
         else risk = 'low';
+
         return {
-          flightNum: f.flight_iata || '—',
-          depAirport: f.dep_iata, dest: f.arr_iata,
-          gate: f.dep_gate || '—', terminal: f.dep_terminal || '—',
-          schedDep: fmtTime(f.dep_time), estDep: fmtTime(f.dep_estimated || f.dep_actual),
-          schedArr: fmtTime(f.arr_time), estArr: fmtTime(f.arr_estimated || f.arr_actual),
-          duration: f.duration, depDelay, arrDelay,
-          status: f.status || '—', risk
+          flightNum: f.ident_iata || f.ident || '—',
+          depAirport: f.origin?.code_iata || '—',
+          dest: f.destination?.code_iata || '—',
+          gate: f.gate_origin || '—',
+          terminal: f.terminal_origin || '—',
+          schedDep: fmtTime(f.scheduled_out, tz),
+          estDep: fmtTime(f.estimated_off || f.estimated_out, tz),
+          schedArr: fmtTime(f.scheduled_in, f.destination?.timezone),
+          estArr: fmtTime(f.estimated_in, f.destination?.timezone),
+          duration: durMins,
+          depDelay: depDelayMins,
+          arrDelay: arrDelayMins,
+          status: f.status || '—',
+          inboundFlightId: f.inbound_fa_flight_id || null,
+          risk
         };
       })
       .sort((a, b) => {
@@ -81,15 +104,9 @@ app.get('/api/delays', async (req, res) => {
         return r[a.risk] - r[b.risk] || b.depDelay - a.depDelay;
       });
 
-    res.json({ 
-      success: true, 
-      data: filtered, 
-      total: raw.length,
-      serverTime: new Date().toISOString(),
-      timestamp: new Date().toISOString() 
-    });
+    res.json({ success: true, data: filtered, total: flights.length, timestamp: new Date().toISOString() });
   } catch(e) {
-    res.json({ success: false, error: e.message });
+    res.json({ success: false, error: e.message, details: e.response?.data });
   }
 });
 
