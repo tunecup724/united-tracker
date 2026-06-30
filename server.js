@@ -12,11 +12,8 @@ const PORT = process.env.PORT || 3000;
 const FA_KEY = '7s7aNdZg9AzDzG3QA5oJ0GdpaCpjjTdt';
 const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
-// Reduced to top 15 hubs to stay within rate limits
-const AIRPORTS = [
-  'KORD','KEWR','KIAH','KDEN','KSFO','KLAX','KIAD','KMIA','KBOS','KSEA',
-  'KATL','KDFW','KPHX','KMCO','KSLC'
-];
+// Limited to United's biggest hubs to stay well under 10 req/min
+const AIRPORTS = ['KORD', 'KEWR', 'KIAH', 'KDEN', 'KSFO', 'KLAX', 'KIAD'];
 
 function fmtTime(isoStr, timezone) {
   if (!isoStr) return '—';
@@ -47,12 +44,12 @@ app.get('/api/delays', async (req, res) => {
     const allFlights = [];
     const errors = [];
 
-    // One airport at a time with delay between each - respects rate limits
+    // 7 seconds between each call = well under 10/min limit
     for (const airport of AIRPORTS) {
       const result = await fetchAirportDepartures(airport);
       allFlights.push(...result.flights);
       if (result.error) errors.push(`${result.airport}: ${result.error}`);
-      await new Promise(r => setTimeout(r, 1000)); // 1 second between each call
+      await new Promise(r => setTimeout(r, 7000));
     }
 
     const filtered = allFlights
