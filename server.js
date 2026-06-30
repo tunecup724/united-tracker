@@ -22,15 +22,21 @@ function fmtTime(isoStr, timezone) {
   } catch { return '—'; }
 }
 
-function fmtDur(mins) {
-  if (!mins) return '—';
-  const h = Math.floor(mins / 60), m = mins % 60;
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
+app.get('/api/test', async (req, res) => {
+  try {
+    const response = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
+      headers: { 'x-apikey': FA_KEY },
+      params: { max_pages: 1 },
+      timeout: 15000
+    });
+    res.json({ success: true, status: response.status, data: response.data });
+  } catch(e) {
+    res.json({ success: false, error: e.message, status: e.response?.status, details: e.response?.data });
+  }
+});
 
 app.get('/api/delays', async (req, res) => {
   try {
-    // Get all scheduled United departures
     const response = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
       headers: { 'x-apikey': FA_KEY },
       params: { max_pages: 5 },
@@ -42,45 +48,28 @@ app.get('/api/delays', async (req, res) => {
 
     const filtered = flights
       .filter(f => {
-        // Must have departure delay of 30+ mins
         const depDelay = f.departure_delay || 0;
-        if (depDelay < 1800) return false; // FlightAware delay is in seconds
-
-        // Must not have actually departed yet
+        if (depDelay < 1800) return false;
         if (f.actual_off) return false;
-
-        // Estimated departure must be in the future
         const estDep = f.estimated_off || f.scheduled_out;
-        if (!estDep) return false;
-        if (new Date(estDep) <= now) return false;
-
-        // Duration must be <= 2 hours
-        const schedOut = f.scheduled_out;
-        const schedIn = f.scheduled_in;
-        if (!schedOut || !schedIn) return false;
-        const durMins = (new Date(schedIn) - new Date(schedOut)) / 60000;
-        if (durMins > 120) return false;
-
+        if (!estDep || new Date(estDep) <= now) return false;
+        const durMins = f.scheduled_out && f.scheduled_in
+          ? (new Date(f.scheduled_in) - new Date(f.scheduled_out)) / 60000
+          : null;
+        if (!durMins || durMins > 120) return false;
         return true;
       })
       .map(f => {
         const tz = f.origin?.timezone || 'America/New_York';
-        const depDelaySecs = f.departure_delay || 0;
-        const arrDelaySecs = f.arrival_delay || 0;
-        const depDelayMins = Math.round(depDelaySecs / 60);
-        const arrDelayMins = Math.round(arrDelaySecs / 60);
-
-        const schedOut = f.scheduled_out;
-        const schedIn = f.scheduled_in;
-        const durMins = schedOut && schedIn
-          ? Math.round((new Date(schedIn) - new Date(schedOut)) / 60000)
+        const depDelayMins = Math.round((f.departure_delay || 0) / 60);
+        const arrDelayMins = Math.round((f.arrival_delay || 0) / 60);
+        const durMins = f.scheduled_out && f.scheduled_in
+          ? Math.round((new Date(f.scheduled_in) - new Date(f.scheduled_out)) / 60000)
           : null;
-
         let risk;
         if (depDelayMins >= 90 || arrDelayMins >= 60) risk = 'high';
         else if (depDelayMins >= 45 || arrDelayMins >= 25) risk = 'med';
         else risk = 'low';
-
         return {
           flightNum: f.ident_iata || f.ident || '—',
           depAirport: f.origin?.code_iata || '—',
