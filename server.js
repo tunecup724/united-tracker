@@ -22,12 +22,32 @@ function fmtTime(isoStr, timezone) {
   } catch { return '—'; }
 }
 
+async function getInboundFlight(faFlightId, tz) {
+  try {
+    const r = await axios.get(`${FA_URL}/flights/${faFlightId}`, {
+      headers: { 'x-apikey': FA_KEY },
+      timeout: 10000
+    });
+    const f = r.data?.flights?.[0];
+    if (!f) return null;
+    return {
+      inboundFlightNum: f.ident_iata || f.ident || '—',
+      inboundOrigin: f.origin?.code_iata || '—',
+      inboundSchedArr: fmtTime(f.scheduled_in, tz),
+      inboundEstArr: fmtTime(f.estimated_in || f.estimated_on, tz),
+      inboundActualArr: fmtTime(f.actual_in || f.actual_on, tz),
+      inboundStatus: f.status || '—'
+    };
+  } catch(e) {
+    return null;
+  }
+}
+
 app.get('/api/delays', async (req, res) => {
   try {
     const now = new Date();
     const allFlights = [];
 
-    // Fetch all pages of United scheduled flights
     let cursor = null;
     let pageCount = 0;
     const maxPages = 20;
@@ -46,11 +66,8 @@ app.get('/api/delays', async (req, res) => {
       allFlights.push(...flights);
       pageCount++;
 
-      // Check if there are more pages
       const nextCursor = r.data?.links?.next;
       if (!nextCursor || flights.length === 0) break;
-
-      // Extract cursor from next link
       const cursorMatch = nextCursor.match(/cursor=([^&]+)/);
       cursor = cursorMatch ? cursorMatch[1] : null;
       if (!cursor) break;
@@ -62,20 +79,16 @@ app.get('/api/delays', async (req, res) => {
       .filter(f => {
         const depDelay = f.departure_delay || 0;
         if (depDelay < 1800) return false;
-
         const statusLower = (f.status || '').toLowerCase();
         if (f.actual_off) return false;
         if (statusLower.includes('taxiing') || statusLower.includes('en route') ||
             statusLower.includes('landed') || statusLower.includes('arrived')) return false;
-
         if (!f.scheduled_out) return false;
         const minsUntilSchedDep = (new Date(f.scheduled_out) - now) / 60000;
         if (minsUntilSchedDep < 30) return false;
-
         if (!f.scheduled_in) return false;
         const durMins = (new Date(f.scheduled_in) - new Date(f.scheduled_out)) / 60000;
         if (durMins > 120 || durMins <= 0) return false;
-
         return true;
       })
       .map(f => {
@@ -84,8 +97,8 @@ app.get('/api/delays', async (req, res) => {
         const arrDelayMins = Math.round((f.arrival_delay || 0) / 60);
         const durMins = Math.round((new Date(f.scheduled_in) - new Date(f.scheduled_out)) / 60000);
         let risk;
-        if (depDelayMins >= 90 || arrDelayMins >= 60) risk = 'high';
-        else if (depDelayMins >= 45 || arrDelayMins >= 25) risk = 'med';
+        if (depDelayMins >= 90) risk = 'high';
+        else if (depDelayMins >= 45) risk = 'med';
         else risk = 'low';
         return {
           flightNum: f.ident_iata || f.ident || '—',
@@ -94,7 +107,7 @@ app.get('/api/delays', async (req, res) => {
           gate: f.gate_origin || '—',
           terminal: f.terminal_origin || '—',
           schedDep: fmtTime(f.scheduled_out, tz),
-          estDep: fmtTime(f.estimated_off || f.estimated_out, tz),
+          estDep: fmtTime(f.estimated_out || f.estimated_off, tz),
           schedArr: fmtTime(f.scheduled_in, f.destination?.timezone),
           estArr: fmtTime(f.estimated_in, f.destination?.timezone),
           duration: durMins,
@@ -102,6 +115,7 @@ app.get('/api/delays', async (req, res) => {
           arrDelay: arrDelayMins,
           status: f.status || '—',
           inboundFlightId: f.inbound_fa_flight_id || null,
+          originTz: tz,
           risk
         };
       })
@@ -109,6 +123,17 @@ app.get('/api/delays', async (req, res) => {
         const r = { high: 0, med: 1, low: 2 };
         return r[a.risk] - r[b.risk] || b.depDelay - a.depDelay;
       });
+
+    // Fetch inbound flight details for each delayed flight
+    for (let i = 0; i < filtered.length; i++) {
+      if (filtered[i].inboundFlightId) {
+        const inbound = await getInboundFlight(filtered[i].inboundFlightId, filtered[i].originTz);
+        if (inbound) {
+          filtered[i] = { ...filtered[i], ...inbound };
+        }
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
 
     res.json({
       success: true,
