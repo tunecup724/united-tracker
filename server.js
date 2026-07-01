@@ -48,47 +48,58 @@ app.get('/api/delays', async (req, res) => {
     const now = new Date();
     const allFlights = [];
 
-    let cursor = null;
-    let pageCount = 0;
-    const maxPages = 20;
+    // Fetch all pages using max_pages to get as many as possible in one call
+    const r = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
+      headers: { 'x-apikey': FA_KEY },
+      params: { max_pages: 20 },
+      timeout: 30000
+    });
 
-    while (pageCount < maxPages) {
-      const params = { max_pages: 1 };
-      if (cursor) params.cursor = cursor;
+    const flights = r.data?.scheduled || [];
+    allFlights.push(...flights);
 
-      const r = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
+    // If there are more pages, follow the cursor
+    let nextLink = r.data?.links?.next;
+    let pageCount = 1;
+
+    while (nextLink && pageCount < 10) {
+      const cursorMatch = nextLink.match(/cursor=([^&]+)/);
+      if (!cursorMatch) break;
+      const cursor = cursorMatch[1];
+
+      await new Promise(r => setTimeout(r, 500));
+
+      const r2 = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
         headers: { 'x-apikey': FA_KEY },
-        params,
-        timeout: 15000
+        params: { max_pages: 20, cursor },
+        timeout: 30000
       });
 
-      const flights = r.data?.scheduled || [];
-      allFlights.push(...flights);
+      const more = r2.data?.scheduled || [];
+      allFlights.push(...more);
+      nextLink = r2.data?.links?.next;
       pageCount++;
-
-      const nextCursor = r.data?.links?.next;
-      if (!nextCursor || flights.length === 0) break;
-      const cursorMatch = nextCursor.match(/cursor=([^&]+)/);
-      cursor = cursorMatch ? cursorMatch[1] : null;
-      if (!cursor) break;
-
-      await new Promise(r => setTimeout(r, 300));
+      if (more.length === 0) break;
     }
 
     const filtered = allFlights
       .filter(f => {
         const depDelay = f.departure_delay || 0;
         if (depDelay < 1800) return false;
+
         const statusLower = (f.status || '').toLowerCase();
         if (f.actual_off) return false;
         if (statusLower.includes('taxiing') || statusLower.includes('en route') ||
             statusLower.includes('landed') || statusLower.includes('arrived')) return false;
+
         if (!f.scheduled_out) return false;
         const minsUntilSchedDep = (new Date(f.scheduled_out) - now) / 60000;
         if (minsUntilSchedDep < 30) return false;
+
         if (!f.scheduled_in) return false;
         const durMins = (new Date(f.scheduled_in) - new Date(f.scheduled_out)) / 60000;
-        if (durMins > 120 || durMins <= 0) return false;
+        if (durMins > 130 || durMins <= 0) return false;
+
         return true;
       })
       .map(f => {
@@ -124,13 +135,11 @@ app.get('/api/delays', async (req, res) => {
         return r[a.risk] - r[b.risk] || b.depDelay - a.depDelay;
       });
 
-    // Fetch inbound flight details for each delayed flight
+    // Fetch inbound flight details
     for (let i = 0; i < filtered.length; i++) {
       if (filtered[i].inboundFlightId) {
         const inbound = await getInboundFlight(filtered[i].inboundFlightId, filtered[i].originTz);
-        if (inbound) {
-          filtered[i] = { ...filtered[i], ...inbound };
-        }
+        if (inbound) filtered[i] = { ...filtered[i], ...inbound };
         await new Promise(r => setTimeout(r, 300));
       }
     }
