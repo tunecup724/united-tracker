@@ -12,6 +12,9 @@ const PORT = process.env.PORT || 3000;
 const FA_KEY = '7s7aNdZg9AzDzG3QA5oJ0GdpaCpjjTdt';
 const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
+// United mainline + all United Express regional operators
+const OPERATORS = ['UAL', 'SKW', 'MQ', 'YX', 'CP', 'G7'];
+
 function fmtTime(isoStr, timezone) {
   if (!isoStr) return '—';
   try {
@@ -43,47 +46,65 @@ async function getInboundFlight(faFlightId, tz) {
   }
 }
 
+async function fetchOperatorFlights(operator) {
+  const flights = [];
+  try {
+    const r = await axios.get(`${FA_URL}/operators/${operator}/flights/scheduled`, {
+      headers: { 'x-apikey': FA_KEY },
+      params: { max_pages: 20 },
+      timeout: 30000
+    });
+    flights.push(...(r.data?.scheduled || []));
+
+    // Follow cursor if more pages
+    let nextLink = r.data?.links?.next;
+    let pageCount = 1;
+    while (nextLink && pageCount < 5) {
+      const cursorMatch = nextLink.match(/cursor=([^&]+)/);
+      if (!cursorMatch) break;
+      await new Promise(r => setTimeout(r, 500));
+      const r2 = await axios.get(`${FA_URL}/operators/${operator}/flights/scheduled`, {
+        headers: { 'x-apikey': FA_KEY },
+        params: { max_pages: 20, cursor: cursorMatch[1] },
+        timeout: 30000
+      });
+      flights.push(...(r2.data?.scheduled || []));
+      nextLink = r2.data?.links?.next;
+      pageCount++;
+    }
+  } catch(e) {
+    console.warn(`Failed ${operator}:`, e.message);
+  }
+  return flights;
+}
+
 app.get('/api/delays', async (req, res) => {
   try {
     const now = new Date();
     const allFlights = [];
 
-    // Fetch all pages using max_pages to get as many as possible in one call
-    const r = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
-      headers: { 'x-apikey': FA_KEY },
-      params: { max_pages: 20 },
-      timeout: 30000
-    });
-
-    const flights = r.data?.scheduled || [];
-    allFlights.push(...flights);
-
-    // If there are more pages, follow the cursor
-    let nextLink = r.data?.links?.next;
-    let pageCount = 1;
-
-    while (nextLink && pageCount < 10) {
-      const cursorMatch = nextLink.match(/cursor=([^&]+)/);
-      if (!cursorMatch) break;
-      const cursor = cursorMatch[1];
-
+    // Fetch all operators sequentially to avoid rate limits
+    for (const op of OPERATORS) {
+      const flights = await fetchOperatorFlights(op);
+      allFlights.push(...flights);
       await new Promise(r => setTimeout(r, 500));
-
-      const r2 = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
-        headers: { 'x-apikey': FA_KEY },
-        params: { max_pages: 20, cursor },
-        timeout: 30000
-      });
-
-      const more = r2.data?.scheduled || [];
-      allFlights.push(...more);
-      nextLink = r2.data?.links?.next;
-      pageCount++;
-      if (more.length === 0) break;
     }
 
-    const filtered = allFlights
+    // Deduplicate by flight number + scheduled departure
+    const seen = new Set();
+    const dedupedFlights = allFlights.filter(f => {
+      const key = `${f.ident_iata||f.ident}-${f.scheduled_out}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    const filtered = dedupedFlights
       .filter(f => {
+        // Must be a UA-coded flight
+        const iataIdent = f.ident_iata || '';
+        if (!iataIdent.startsWith('UA')) return false;
+
         const depDelay = f.departure_delay || 0;
         if (depDelay < 1800) return false;
 
@@ -147,8 +168,7 @@ app.get('/api/delays', async (req, res) => {
     res.json({
       success: true,
       data: filtered,
-      total: allFlights.length,
-      pages_fetched: pageCount,
+      total: dedupedFlights.length,
       timestamp: new Date().toISOString()
     });
   } catch(e) {
