@@ -15,6 +15,9 @@ const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 const TURNAROUND_MIN = 35;
 const REFRESH_INTERVAL_MIN = 25;
 
+// United mainline + regional carriers that operate United Express
+const OPERATORS = ['UAL', 'SKW', 'RPA', 'ASQ', 'GJS', 'AWI', 'CPZ', 'EDV'];
+
 let cache = {
   data: [],
   total: 0,
@@ -22,7 +25,8 @@ let cache = {
   predictedDelays: 0,
   lastUpdated: null,
   refreshing: false,
-  lastError: null
+  lastError: null,
+  operatorStats: {}
 };
 
 function fmtTime(isoStr, timezone) {
@@ -47,31 +51,52 @@ async function getInboundFlight(faFlightId) {
   }
 }
 
-async function fetchAllOperatorFlights() {
-  const allFlights = [];
-  const r = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
-    headers: { 'x-apikey': FA_KEY },
-    params: { max_pages: 20 },
-    timeout: 30000
-  });
-  allFlights.push(...(r.data?.scheduled || []));
-
-  let nextLink = r.data?.links?.next;
-  let pageCount = 1;
-  while (nextLink && pageCount < 10) {
-    const cursorMatch = nextLink.match(/cursor=([^&]+)/);
-    if (!cursorMatch) break;
-    await new Promise(r => setTimeout(r, 300));
-    const r2 = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
+// Fetch all pages for one operator, with a much higher ceiling
+async function fetchOperatorFlights(operator, maxPageLoops = 40) {
+  const flights = [];
+  try {
+    const r = await axios.get(`${FA_URL}/operators/${operator}/flights/scheduled`, {
       headers: { 'x-apikey': FA_KEY },
-      params: { max_pages: 20, cursor: cursorMatch[1] },
+      params: { max_pages: 20 },
       timeout: 30000
     });
-    allFlights.push(...(r2.data?.scheduled || []));
-    nextLink = r2.data?.links?.next;
-    pageCount++;
+    flights.push(...(r.data?.scheduled || []));
+
+    let nextLink = r.data?.links?.next;
+    let loops = 1;
+    while (nextLink && loops < maxPageLoops) {
+      const cursorMatch = nextLink.match(/cursor=([^&]+)/);
+      if (!cursorMatch) break;
+      await new Promise(r => setTimeout(r, 400));
+      const r2 = await axios.get(`${FA_URL}/operators/${operator}/flights/scheduled`, {
+        headers: { 'x-apikey': FA_KEY },
+        params: { max_pages: 20, cursor: cursorMatch[1] },
+        timeout: 30000
+      });
+      const batch = r2.data?.scheduled || [];
+      flights.push(...batch);
+      nextLink = r2.data?.links?.next;
+      loops++;
+      if (batch.length === 0) break;
+    }
+  } catch(e) {
+    console.warn(`Operator ${operator} fetch issue:`, e.response?.status || e.message);
   }
-  return allFlights;
+  return flights;
+}
+
+async function fetchAllFlights() {
+  const all = [];
+  const stats = {};
+  for (const op of OPERATORS) {
+    const flights = await fetchOperatorFlights(op);
+    // Keep only UA-coded flights (filters out non-United flying by regionals)
+    const uaOnly = flights.filter(f => (f.ident_iata || f.ident || '').startsWith('UA'));
+    stats[op] = { fetched: flights.length, uaCoded: uaOnly.length };
+    all.push(...uaOnly);
+    await new Promise(r => setTimeout(r, 600));
+  }
+  return { flights: all, stats };
 }
 
 function baseEligible(f, now) {
@@ -117,6 +142,7 @@ function mapFlight(f, extra = {}) {
     depDelay: depDelayMins,
     arrDelay: arrDelayMins,
     status: f.status || '—',
+    operatedBy: f.operator || '—',
     risk,
     _estDepIso: f.estimated_out || f.estimated_off || f.scheduled_out,
     _schedDepIso: f.scheduled_out,
@@ -162,7 +188,7 @@ async function refreshCache() {
 
   try {
     const now = new Date();
-    const raw = await fetchAllOperatorFlights();
+    const { flights: raw, stats } = await fetchAllFlights();
 
     const seen = new Set();
     const deduped = raw.filter(f => {
@@ -190,7 +216,7 @@ async function refreshCache() {
     const all = [...delayed, ...candidates];
     for (let i = 0; i < all.length; i += 10) {
       await Promise.all(all.slice(i, i + 10).map(f => attachInbound(f)));
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, 250));
     }
 
     const predicted = candidates.filter(f => {
@@ -218,8 +244,10 @@ async function refreshCache() {
     cache.predictedDelays = predicted.length;
     cache.lastUpdated = new Date().toISOString();
     cache.lastError = null;
+    cache.operatorStats = stats;
 
-    console.log(`Cache refreshed: ${delayed.length} confirmed, ${predicted.length} predicted, ${deduped.length} scanned`);
+    console.log(`Cache refreshed: ${delayed.length} confirmed, ${predicted.length} predicted, ${deduped.length} UA flights scanned`);
+    console.log('Operator breakdown:', JSON.stringify(stats));
   } catch(e) {
     cache.lastError = e.message + (e.response?.status ? ` (HTTP ${e.response.status})` : '');
     console.error('Cache refresh failed:', e.message);
@@ -238,37 +266,32 @@ app.get('/api/delays', (req, res) => {
     lastUpdated: cache.lastUpdated,
     refreshing: cache.refreshing,
     lastError: cache.lastError,
+    operatorStats: cache.operatorStats,
     timestamp: new Date().toISOString()
   });
 });
 
 app.get('/api/force-refresh', async (req, res) => {
   refreshCache();
-  res.json({ success: true, message: 'Refresh started in background. Check back in 1-2 minutes.' });
+  res.json({ success: true, message: 'Refresh started in background. Check back in 2-4 minutes.' });
 });
 
-// DEBUG — answers: are regionals included? what time window do we get?
 app.get('/api/debug', async (req, res) => {
   try {
-    const raw = await fetchAllOperatorFlights();
+    const { flights: raw, stats } = await fetchAllFlights();
     const idents = raw.map(f => f.ident_iata || f.ident || '');
-    const uaCoded = idents.filter(i => i.startsWith('UA'));
-
-    const nums = uaCoded.map(i => parseInt(i.replace(/\D/g,''))).filter(n => !isNaN(n));
-    const under3000 = nums.filter(n => n < 3000).length;
-    const over3000 = nums.filter(n => n >= 3000).length;
-
+    const nums = idents.map(i => parseInt(i.replace(/\D/g,''))).filter(n => !isNaN(n));
     const times = raw.map(f => f.scheduled_out).filter(Boolean).sort();
 
     res.json({
-      totalReturned: raw.length,
-      uaCodedCount: uaCoded.length,
-      mainline_under3000: under3000,
-      regional_over3000: over3000,
+      totalUAFlights: raw.length,
+      mainline_under3000: nums.filter(n => n < 3000).length,
+      regional_3000plus: nums.filter(n => n >= 3000).length,
+      regional_4000plus: nums.filter(n => n >= 4000).length,
       earliestSchedOut: times[0],
       latestSchedOut: times[times.length - 1],
-      operatorsSeen: [...new Set(raw.map(f => f.operator))].slice(0, 20),
-      sampleHighNumbers: uaCoded.filter(i => parseInt(i.replace(/\D/g,'')) >= 3000).slice(0, 10)
+      operatorStats: stats,
+      sampleRegionals: idents.filter(i => parseInt(i.replace(/\D/g,'')) >= 4000).slice(0, 15)
     });
   } catch(e) {
     res.json({ error: e.message, status: e.response?.status });
