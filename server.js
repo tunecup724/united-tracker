@@ -12,7 +12,18 @@ const PORT = process.env.PORT || 3000;
 const FA_KEY = '7s7aNdZg9AzDzG3QA5oJ0GdpaCpjjTdt';
 const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
-const TURNAROUND_MIN = 35; // minimum minutes to unload/board a domestic narrowbody
+const TURNAROUND_MIN = 35;
+const REFRESH_INTERVAL_MIN = 25;
+
+// In-memory cache
+let cache = {
+  data: [],
+  total: 0,
+  confirmedDelays: 0,
+  predictedDelays: 0,
+  lastUpdated: null,
+  refreshing: false
+};
 
 function fmtTime(isoStr, timezone) {
   if (!isoStr) return '—';
@@ -115,7 +126,6 @@ function mapFlight(f, extra = {}) {
   };
 }
 
-// Attach inbound info + compute slip prediction
 async function attachInbound(flight) {
   if (!flight._inboundId) return flight;
   const inb = await getInboundFlight(flight._inboundId);
@@ -131,7 +141,6 @@ async function attachInbound(flight) {
   flight.inboundActualArr = fmtTime(inb.actual_in || inb.actual_on, tz);
   flight.inboundLanded = !!(inb.actual_in || inb.actual_on);
 
-  // SLIP PREDICTION: inbound est arrival + turnaround vs estimated departure
   if (inbEstArrIso && flight._estDepIso && !flight.inboundLanded) {
     const readyTime = new Date(inbEstArrIso).getTime() + TURNAROUND_MIN * 60000;
     const estDepTime = new Date(flight._estDepIso).getTime();
@@ -146,12 +155,15 @@ async function attachInbound(flight) {
   return flight;
 }
 
-app.get('/api/delays', async (req, res) => {
+async function refreshCache() {
+  if (cache.refreshing) return;
+  cache.refreshing = true;
+  console.log('Cache refresh started at', new Date().toISOString());
+
   try {
     const now = new Date();
     const raw = await fetchAllOperatorFlights();
 
-    // Dedupe
     const seen = new Set();
     const deduped = raw.filter(f => {
       const key = `${f.ident_iata||f.ident}-${f.scheduled_out}`;
@@ -162,46 +174,40 @@ app.get('/api/delays', async (req, res) => {
 
     const eligible = deduped.filter(f => baseEligible(f, now));
 
-    // GROUP A: Already delayed 30+ min
+    // Confirmed delays
     const delayed = eligible
       .filter(f => (f.departure_delay || 0) >= 1800)
       .map(f => mapFlight(f, { predicted: false }));
 
-    // GROUP B: Not delayed yet, departing within next 3 hours, has inbound — candidates for predicted delay
+    // Predicted candidates - ALL future flights with an inbound, no time window
     const candidates = eligible
       .filter(f => {
         const depDelay = f.departure_delay || 0;
         if (depDelay >= 1800) return false;
         if (!f.inbound_fa_flight_id) return false;
-        const minsUntil = (new Date(f.scheduled_out) - now) / 60000;
-        return minsUntil <= 180; // next 3 hours only, to limit API calls
+        return true;
       })
       .map(f => mapFlight(f, { predicted: true }));
 
-    // Attach inbound info in parallel chunks of 5
+    // Attach inbound info in parallel chunks of 10
     const all = [...delayed, ...candidates];
-    for (let i = 0; i < all.length; i += 5) {
-      await Promise.all(all.slice(i, i + 5).map(f => attachInbound(f)));
+    for (let i = 0; i < all.length; i += 10) {
+      await Promise.all(all.slice(i, i + 10).map(f => attachInbound(f)));
+      await new Promise(r => setTimeout(r, 200));
     }
 
-    // Keep candidates ONLY if inbound math predicts 30+ min effective delay vs scheduled dep
+    // Keep predicted only if inbound math shows 30+ min effective delay vs scheduled
     const predicted = candidates.filter(f => {
       if (!f.inboundEstArr || f.inboundLanded) return false;
-      // predicted ready time vs SCHEDULED departure
-      const inbEstArrIso = null; // use slip fields computed against est dep; recompute vs sched:
-      return f.willSlip && f.slipMins >= 1 &&
-        // effective delay vs scheduled departure must be >= 30 min
-        (() => {
-          const schedDep = new Date(f._schedDepIso).getTime();
-          const estDep = new Date(f._estDepIso).getTime();
-          const readyTime = estDep + f.slipMins * 60000;
-          return (readyTime - schedDep) / 60000 >= 30;
-        })();
+      if (!f.willSlip) return false;
+      const schedDep = new Date(f._schedDepIso).getTime();
+      const estDep = new Date(f._estDepIso).getTime();
+      const readyTime = estDep + f.slipMins * 60000;
+      return (readyTime - schedDep) / 60000 >= 30;
     });
 
     const finalList = [...delayed, ...predicted]
       .map(f => {
-        // cleanup internal fields
         const { _estDepIso, _schedDepIso, _inboundId, _tz, ...clean } = f;
         return clean;
       })
@@ -210,21 +216,47 @@ app.get('/api/delays', async (req, res) => {
         return (r[a.risk] - r[b.risk]) || (b.depDelay - a.depDelay);
       });
 
-    res.json({
-      success: true,
-      data: finalList,
-      total: deduped.length,
-      confirmedDelays: delayed.length,
-      predictedDelays: predicted.length,
-      timestamp: new Date().toISOString()
-    });
+    cache.data = finalList;
+    cache.total = deduped.length;
+    cache.confirmedDelays = delayed.length;
+    cache.predictedDelays = predicted.length;
+    cache.lastUpdated = new Date().toISOString();
+
+    console.log(`Cache refreshed: ${delayed.length} confirmed, ${predicted.length} predicted, ${deduped.length} scanned`);
   } catch(e) {
-    res.json({ success: false, error: e.message });
+    console.error('Cache refresh failed:', e.message);
+  } finally {
+    cache.refreshing = false;
   }
+}
+
+// Serve from cache instantly
+app.get('/api/delays', (req, res) => {
+  res.json({
+    success: true,
+    data: cache.data,
+    total: cache.total,
+    confirmedDelays: cache.confirmedDelays,
+    predictedDelays: cache.predictedDelays,
+    lastUpdated: cache.lastUpdated,
+    refreshing: cache.refreshing,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Manual force refresh endpoint
+app.get('/api/force-refresh', async (req, res) => {
+  refreshCache(); // fire and forget
+  res.json({ success: true, message: 'Refresh started in background. Check back in 1-2 minutes.' });
 });
 
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  // Initial refresh on startup, then every 25 minutes
+  refreshCache();
+  setInterval(refreshCache, REFRESH_INTERVAL_MIN * 60 * 1000);
+});
