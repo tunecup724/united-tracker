@@ -15,14 +15,14 @@ const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 const TURNAROUND_MIN = 35;
 const REFRESH_INTERVAL_MIN = 25;
 
-// In-memory cache
 let cache = {
   data: [],
   total: 0,
   confirmedDelays: 0,
   predictedDelays: 0,
   lastUpdated: null,
-  refreshing: false
+  refreshing: false,
+  lastError: null
 };
 
 function fmtTime(isoStr, timezone) {
@@ -174,12 +174,10 @@ async function refreshCache() {
 
     const eligible = deduped.filter(f => baseEligible(f, now));
 
-    // Confirmed delays
     const delayed = eligible
       .filter(f => (f.departure_delay || 0) >= 1800)
       .map(f => mapFlight(f, { predicted: false }));
 
-    // Predicted candidates - ALL future flights with an inbound, no time window
     const candidates = eligible
       .filter(f => {
         const depDelay = f.departure_delay || 0;
@@ -189,14 +187,12 @@ async function refreshCache() {
       })
       .map(f => mapFlight(f, { predicted: true }));
 
-    // Attach inbound info in parallel chunks of 10
     const all = [...delayed, ...candidates];
     for (let i = 0; i < all.length; i += 10) {
       await Promise.all(all.slice(i, i + 10).map(f => attachInbound(f)));
       await new Promise(r => setTimeout(r, 200));
     }
 
-    // Keep predicted only if inbound math shows 30+ min effective delay vs scheduled
     const predicted = candidates.filter(f => {
       if (!f.inboundEstArr || f.inboundLanded) return false;
       if (!f.willSlip) return false;
@@ -221,16 +217,17 @@ async function refreshCache() {
     cache.confirmedDelays = delayed.length;
     cache.predictedDelays = predicted.length;
     cache.lastUpdated = new Date().toISOString();
+    cache.lastError = null;
 
     console.log(`Cache refreshed: ${delayed.length} confirmed, ${predicted.length} predicted, ${deduped.length} scanned`);
   } catch(e) {
+    cache.lastError = e.message + (e.response?.status ? ` (HTTP ${e.response.status})` : '');
     console.error('Cache refresh failed:', e.message);
   } finally {
     cache.refreshing = false;
   }
 }
 
-// Serve from cache instantly
 app.get('/api/delays', (req, res) => {
   res.json({
     success: true,
@@ -240,14 +237,42 @@ app.get('/api/delays', (req, res) => {
     predictedDelays: cache.predictedDelays,
     lastUpdated: cache.lastUpdated,
     refreshing: cache.refreshing,
+    lastError: cache.lastError,
     timestamp: new Date().toISOString()
   });
 });
 
-// Manual force refresh endpoint
 app.get('/api/force-refresh', async (req, res) => {
-  refreshCache(); // fire and forget
+  refreshCache();
   res.json({ success: true, message: 'Refresh started in background. Check back in 1-2 minutes.' });
+});
+
+// DEBUG — answers: are regionals included? what time window do we get?
+app.get('/api/debug', async (req, res) => {
+  try {
+    const raw = await fetchAllOperatorFlights();
+    const idents = raw.map(f => f.ident_iata || f.ident || '');
+    const uaCoded = idents.filter(i => i.startsWith('UA'));
+
+    const nums = uaCoded.map(i => parseInt(i.replace(/\D/g,''))).filter(n => !isNaN(n));
+    const under3000 = nums.filter(n => n < 3000).length;
+    const over3000 = nums.filter(n => n >= 3000).length;
+
+    const times = raw.map(f => f.scheduled_out).filter(Boolean).sort();
+
+    res.json({
+      totalReturned: raw.length,
+      uaCodedCount: uaCoded.length,
+      mainline_under3000: under3000,
+      regional_over3000: over3000,
+      earliestSchedOut: times[0],
+      latestSchedOut: times[times.length - 1],
+      operatorsSeen: [...new Set(raw.map(f => f.operator))].slice(0, 20),
+      sampleHighNumbers: uaCoded.filter(i => parseInt(i.replace(/\D/g,'')) >= 3000).slice(0, 10)
+    });
+  } catch(e) {
+    res.json({ error: e.message, status: e.response?.status });
+  }
 });
 
 app.get('*', (req, res) => {
@@ -256,7 +281,6 @@ app.get('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  // Initial refresh on startup, then every 25 minutes
   refreshCache();
   setInterval(refreshCache, REFRESH_INTERVAL_MIN * 60 * 1000);
 });
