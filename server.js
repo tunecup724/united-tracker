@@ -14,9 +14,9 @@ const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
 const TURNAROUND_MIN = 35;
 const REFRESH_INTERVAL_MIN = 25;
+const OPERATOR_GAP_MS = 15000; // 15s between operators to stay under rate limits
 
-// United mainline + regional carriers that operate United Express
-const OPERATORS = ['UAL', 'SKW', 'RPA', 'ASQ', 'GJS', 'AWI', 'CPZ', 'EDV'];
+const OPERATORS = ['UAL', 'SKW', 'RPA', 'GJS', 'AWI', 'CPZ'];
 
 let cache = {
   data: [],
@@ -39,6 +39,16 @@ function fmtTime(isoStr, timezone) {
   } catch { return '—'; }
 }
 
+// Get the UA flight number for a flight: either its own ident, or its UA codeshare
+function getUAIdent(f) {
+  const ident = f.ident_iata || f.ident || '';
+  if (ident.startsWith('UA') && !ident.startsWith('UAL')) return ident;
+  if ((f.ident_iata || '').startsWith('UA')) return f.ident_iata;
+  const cs = f.codeshares_iata || [];
+  const ua = cs.find(c => typeof c === 'string' && c.startsWith('UA'));
+  return ua || null;
+}
+
 async function getInboundFlight(faFlightId) {
   try {
     const r = await axios.get(`${FA_URL}/flights/${faFlightId}`, {
@@ -51,9 +61,9 @@ async function getInboundFlight(faFlightId) {
   }
 }
 
-// Fetch all pages for one operator, with a much higher ceiling
 async function fetchOperatorFlights(operator, maxPageLoops = 40) {
   const flights = [];
+  let error = null;
   try {
     const r = await axios.get(`${FA_URL}/operators/${operator}/flights/scheduled`, {
       headers: { 'x-apikey': FA_KEY },
@@ -67,7 +77,7 @@ async function fetchOperatorFlights(operator, maxPageLoops = 40) {
     while (nextLink && loops < maxPageLoops) {
       const cursorMatch = nextLink.match(/cursor=([^&]+)/);
       if (!cursorMatch) break;
-      await new Promise(r => setTimeout(r, 400));
+      await new Promise(r => setTimeout(r, 700));
       const r2 = await axios.get(`${FA_URL}/operators/${operator}/flights/scheduled`, {
         headers: { 'x-apikey': FA_KEY },
         params: { max_pages: 20, cursor: cursorMatch[1] },
@@ -80,28 +90,34 @@ async function fetchOperatorFlights(operator, maxPageLoops = 40) {
       if (batch.length === 0) break;
     }
   } catch(e) {
-    console.warn(`Operator ${operator} fetch issue:`, e.response?.status || e.message);
+    error = e.response?.status ? `HTTP ${e.response.status}` : e.message;
   }
-  return flights;
+  return { flights, error };
 }
 
 async function fetchAllFlights() {
   const all = [];
   const stats = {};
   for (const op of OPERATORS) {
-    const flights = await fetchOperatorFlights(op);
-    // Keep only UA-coded flights (filters out non-United flying by regionals)
-    const uaOnly = flights.filter(f => (f.ident_iata || f.ident || '').startsWith('UA'));
-    stats[op] = { fetched: flights.length, uaCoded: uaOnly.length };
-    all.push(...uaOnly);
-    await new Promise(r => setTimeout(r, 600));
+    const { flights, error } = await fetchOperatorFlights(op);
+    // Keep flights that ARE United or CARRY a UA codeshare
+    const uaFlights = [];
+    for (const f of flights) {
+      const uaIdent = getUAIdent(f);
+      if (uaIdent) {
+        f._uaIdent = uaIdent;
+        uaFlights.push(f);
+      }
+    }
+    stats[op] = { fetched: flights.length, uaCoded: uaFlights.length, error: error || null };
+    all.push(...uaFlights);
+    await new Promise(r => setTimeout(r, OPERATOR_GAP_MS));
   }
   return { flights: all, stats };
 }
 
 function baseEligible(f, now) {
-  const ident = f.ident_iata || f.ident || '';
-  if (!ident.startsWith('UA')) return false;
+  if (!f._uaIdent) return false;
 
   const statusLower = (f.status || '').toLowerCase();
   if (f.actual_off) return false;
@@ -129,7 +145,8 @@ function mapFlight(f, extra = {}) {
   else if (depDelayMins >= 45) risk = 'med';
   else risk = 'low';
   return {
-    flightNum: f.ident_iata || f.ident || '—',
+    flightNum: f._uaIdent,
+    operatedAs: f.ident_iata || f.ident || '—',
     depAirport: f.origin?.code_iata || '—',
     dest: f.destination?.code_iata || '—',
     gate: f.gate_origin || '—',
@@ -192,7 +209,7 @@ async function refreshCache() {
 
     const seen = new Set();
     const deduped = raw.filter(f => {
-      const key = `${f.ident_iata||f.ident}-${f.scheduled_out}`;
+      const key = `${f._uaIdent}-${f.scheduled_out}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -273,29 +290,7 @@ app.get('/api/delays', (req, res) => {
 
 app.get('/api/force-refresh', async (req, res) => {
   refreshCache();
-  res.json({ success: true, message: 'Refresh started in background. Check back in 2-4 minutes.' });
-});
-
-app.get('/api/debug', async (req, res) => {
-  try {
-    const { flights: raw, stats } = await fetchAllFlights();
-    const idents = raw.map(f => f.ident_iata || f.ident || '');
-    const nums = idents.map(i => parseInt(i.replace(/\D/g,''))).filter(n => !isNaN(n));
-    const times = raw.map(f => f.scheduled_out).filter(Boolean).sort();
-
-    res.json({
-      totalUAFlights: raw.length,
-      mainline_under3000: nums.filter(n => n < 3000).length,
-      regional_3000plus: nums.filter(n => n >= 3000).length,
-      regional_4000plus: nums.filter(n => n >= 4000).length,
-      earliestSchedOut: times[0],
-      latestSchedOut: times[times.length - 1],
-      operatorStats: stats,
-      sampleRegionals: idents.filter(i => parseInt(i.replace(/\D/g,'')) >= 4000).slice(0, 15)
-    });
-  } catch(e) {
-    res.json({ error: e.message, status: e.response?.status });
-  }
+  res.json({ success: true, message: 'Refresh started in background. Check back in 3-5 minutes.' });
 });
 
 app.get('*', (req, res) => {
