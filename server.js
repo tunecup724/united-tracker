@@ -13,10 +13,11 @@ const FA_KEY = '7s7aNdZg9AzDzG3QA5oJ0GdpaCpjjTdt';
 const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
 const TURNAROUND_MIN = 35;
-const REFRESH_INTERVAL_MIN = 25;
-const OPERATOR_GAP_MS = 15000; // 15s between operators to stay under rate limits
+const REFRESH_INTERVAL_MIN = 30;
+const CALL_GAP_MS = 7000; // 7s between every API call to stay under 10 req/min
 
-const OPERATORS = ['UAL', 'SKW', 'RPA', 'GJS', 'AWI', 'CPZ'];
+// United mainline + active regional carriers (CPZ removed — defunct)
+const OPERATORS = ['UAL', 'SKW', 'RPA', 'GJS', 'AWI'];
 
 let cache = {
   data: [],
@@ -29,6 +30,15 @@ let cache = {
   operatorStats: {}
 };
 
+// Single shared throttle — guarantees CALL_GAP_MS between ANY two API calls
+let lastCallTime = 0;
+async function throttledGet(url, params) {
+  const wait = CALL_GAP_MS - (Date.now() - lastCallTime);
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  lastCallTime = Date.now();
+  return axios.get(url, { headers: { 'x-apikey': FA_KEY }, params, timeout: 30000 });
+}
+
 function fmtTime(isoStr, timezone) {
   if (!isoStr) return '—';
   try {
@@ -39,11 +49,9 @@ function fmtTime(isoStr, timezone) {
   } catch { return '—'; }
 }
 
-// Get the UA flight number for a flight: either its own ident, or its UA codeshare
 function getUAIdent(f) {
-  const ident = f.ident_iata || f.ident || '';
-  if (ident.startsWith('UA') && !ident.startsWith('UAL')) return ident;
-  if ((f.ident_iata || '').startsWith('UA')) return f.ident_iata;
+  const iata = f.ident_iata || '';
+  if (iata.startsWith('UA')) return iata;
   const cs = f.codeshares_iata || [];
   const ua = cs.find(c => typeof c === 'string' && c.startsWith('UA'));
   return ua || null;
@@ -51,10 +59,7 @@ function getUAIdent(f) {
 
 async function getInboundFlight(faFlightId) {
   try {
-    const r = await axios.get(`${FA_URL}/flights/${faFlightId}`, {
-      headers: { 'x-apikey': FA_KEY },
-      timeout: 8000
-    });
+    const r = await throttledGet(`${FA_URL}/flights/${faFlightId}`, {});
     return r.data?.flights?.[0] || null;
   } catch(e) {
     return null;
@@ -65,11 +70,7 @@ async function fetchOperatorFlights(operator, maxPageLoops = 40) {
   const flights = [];
   let error = null;
   try {
-    const r = await axios.get(`${FA_URL}/operators/${operator}/flights/scheduled`, {
-      headers: { 'x-apikey': FA_KEY },
-      params: { max_pages: 20 },
-      timeout: 30000
-    });
+    const r = await throttledGet(`${FA_URL}/operators/${operator}/flights/scheduled`, { max_pages: 20 });
     flights.push(...(r.data?.scheduled || []));
 
     let nextLink = r.data?.links?.next;
@@ -77,12 +78,7 @@ async function fetchOperatorFlights(operator, maxPageLoops = 40) {
     while (nextLink && loops < maxPageLoops) {
       const cursorMatch = nextLink.match(/cursor=([^&]+)/);
       if (!cursorMatch) break;
-      await new Promise(r => setTimeout(r, 700));
-      const r2 = await axios.get(`${FA_URL}/operators/${operator}/flights/scheduled`, {
-        headers: { 'x-apikey': FA_KEY },
-        params: { max_pages: 20, cursor: cursorMatch[1] },
-        timeout: 30000
-      });
+      const r2 = await throttledGet(`${FA_URL}/operators/${operator}/flights/scheduled`, { max_pages: 20, cursor: cursorMatch[1] });
       const batch = r2.data?.scheduled || [];
       flights.push(...batch);
       nextLink = r2.data?.links?.next;
@@ -100,7 +96,6 @@ async function fetchAllFlights() {
   const stats = {};
   for (const op of OPERATORS) {
     const { flights, error } = await fetchOperatorFlights(op);
-    // Keep flights that ARE United or CARRY a UA codeshare
     const uaFlights = [];
     for (const f of flights) {
       const uaIdent = getUAIdent(f);
@@ -111,7 +106,6 @@ async function fetchAllFlights() {
     }
     stats[op] = { fetched: flights.length, uaCoded: uaFlights.length, error: error || null };
     all.push(...uaFlights);
-    await new Promise(r => setTimeout(r, OPERATOR_GAP_MS));
   }
   return { flights: all, stats };
 }
@@ -231,9 +225,8 @@ async function refreshCache() {
       .map(f => mapFlight(f, { predicted: true }));
 
     const all = [...delayed, ...candidates];
-    for (let i = 0; i < all.length; i += 10) {
-      await Promise.all(all.slice(i, i + 10).map(f => attachInbound(f)));
-      await new Promise(r => setTimeout(r, 250));
+    for (const f of all) {
+      await attachInbound(f);
     }
 
     const predicted = candidates.filter(f => {
@@ -290,7 +283,7 @@ app.get('/api/delays', (req, res) => {
 
 app.get('/api/force-refresh', async (req, res) => {
   refreshCache();
-  res.json({ success: true, message: 'Refresh started in background. Check back in 3-5 minutes.' });
+  res.json({ success: true, message: 'Refresh started in background. Full scan takes 10-15 min.' });
 });
 
 app.get('*', (req, res) => {
