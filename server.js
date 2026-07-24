@@ -14,9 +14,9 @@ const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
 const TURNAROUND_MIN = 35;
 const REFRESH_INTERVAL_MIN = 30;
-const CALL_GAP_MS = 7000; // 7s between every API call to stay under 10 req/min
+const CALL_GAP_MS = 7000;
+const SCAN_TIMEOUT_MS = 20 * 60 * 1000; // 20 min — abandon a scan that runs longer
 
-// United mainline + active regional carriers (CPZ removed — defunct)
 const OPERATORS = ['UAL', 'SKW', 'RPA', 'GJS', 'AWI'];
 
 let cache = {
@@ -26,11 +26,11 @@ let cache = {
   predictedDelays: 0,
   lastUpdated: null,
   refreshing: false,
+  refreshStartedAt: null,
   lastError: null,
   operatorStats: {}
 };
 
-// Single shared throttle — guarantees CALL_GAP_MS between ANY two API calls
 let lastCallTime = 0;
 async function throttledGet(url, params) {
   const wait = CALL_GAP_MS - (Date.now() - lastCallTime);
@@ -112,20 +112,16 @@ async function fetchAllFlights() {
 
 function baseEligible(f, now) {
   if (!f._uaIdent) return false;
-
   const statusLower = (f.status || '').toLowerCase();
   if (f.actual_off) return false;
   if (statusLower.includes('taxiing') || statusLower.includes('en route') ||
       statusLower.includes('landed') || statusLower.includes('arrived')) return false;
-
   if (!f.scheduled_out) return false;
   const minsUntilSchedDep = (new Date(f.scheduled_out) - now) / 60000;
   if (minsUntilSchedDep < 30) return false;
-
   if (!f.scheduled_in) return false;
   const durMins = (new Date(f.scheduled_in) - new Date(f.scheduled_out)) / 60000;
   if (durMins > 130 || durMins <= 0) return false;
-
   return true;
 }
 
@@ -155,8 +151,9 @@ function mapFlight(f, extra = {}) {
     status: f.status || '—',
     operatedBy: f.operator || '—',
     risk,
-    _estDepIso: f.estimated_out || f.estimated_off || f.scheduled_out,
-    _schedDepIso: f.scheduled_out,
+    // Keep ISO fields so the read-time filter can drop departed flights
+    estDepIso: f.estimated_out || f.estimated_off || f.scheduled_out,
+    schedDepIso: f.scheduled_out,
     _inboundId: f.inbound_fa_flight_id || null,
     _tz: tz,
     ...extra
@@ -167,34 +164,34 @@ async function attachInbound(flight) {
   if (!flight._inboundId) return flight;
   const inb = await getInboundFlight(flight._inboundId);
   if (!inb) return flight;
-
   const tz = flight._tz;
   const inbEstArrIso = inb.estimated_in || inb.estimated_on || inb.scheduled_in;
-
   flight.inboundFlightNum = inb.ident_iata || inb.ident || '—';
   flight.inboundOrigin = inb.origin?.code_iata || '—';
   flight.inboundSchedArr = fmtTime(inb.scheduled_in, tz);
   flight.inboundEstArr = fmtTime(inbEstArrIso, tz);
   flight.inboundActualArr = fmtTime(inb.actual_in || inb.actual_on, tz);
   flight.inboundLanded = !!(inb.actual_in || inb.actual_on);
-
-  if (inbEstArrIso && flight._estDepIso && !flight.inboundLanded) {
+  if (inbEstArrIso && flight.estDepIso && !flight.inboundLanded) {
     const readyTime = new Date(inbEstArrIso).getTime() + TURNAROUND_MIN * 60000;
-    const estDepTime = new Date(flight._estDepIso).getTime();
+    const estDepTime = new Date(flight.estDepIso).getTime();
     const slipMins = Math.round((readyTime - estDepTime) / 60000);
-    if (slipMins > 0) {
-      flight.willSlip = true;
-      flight.slipMins = slipMins;
-    } else {
-      flight.willSlip = false;
-    }
+    if (slipMins > 0) { flight.willSlip = true; flight.slipMins = slipMins; }
+    else { flight.willSlip = false; }
   }
   return flight;
 }
 
 async function refreshCache() {
-  if (cache.refreshing) return;
+  // Stuck-scan guard: if a scan has been "refreshing" longer than the timeout, abandon it
+  if (cache.refreshing) {
+    const running = cache.refreshStartedAt ? (Date.now() - cache.refreshStartedAt) : 0;
+    if (running < SCAN_TIMEOUT_MS) return;      // still legitimately running
+    console.warn(`Abandoning stuck scan (running ${Math.round(running/60000)}m)`);
+    // fall through and start a new one
+  }
   cache.refreshing = true;
+  cache.refreshStartedAt = Date.now();
   console.log('Cache refresh started at', new Date().toISOString());
 
   try {
@@ -232,17 +229,13 @@ async function refreshCache() {
     const predicted = candidates.filter(f => {
       if (!f.inboundEstArr || f.inboundLanded) return false;
       if (!f.willSlip) return false;
-      const schedDep = new Date(f._schedDepIso).getTime();
-      const estDep = new Date(f._estDepIso).getTime();
+      const schedDep = new Date(f.schedDepIso).getTime();
+      const estDep = new Date(f.estDepIso).getTime();
       const readyTime = estDep + f.slipMins * 60000;
       return (readyTime - schedDep) / 60000 >= 30;
     });
 
     const finalList = [...delayed, ...predicted]
-      .map(f => {
-        const { _estDepIso, _schedDepIso, _inboundId, _tz, ...clean } = f;
-        return clean;
-      })
       .sort((a, b) => {
         const r = { high: 0, med: 1, low: 2 };
         return (r[a.risk] - r[b.risk]) || (b.depDelay - a.depDelay);
@@ -256,23 +249,33 @@ async function refreshCache() {
     cache.lastError = null;
     cache.operatorStats = stats;
 
-    console.log(`Cache refreshed: ${delayed.length} confirmed, ${predicted.length} predicted, ${deduped.length} UA flights scanned`);
-    console.log('Operator breakdown:', JSON.stringify(stats));
+    console.log(`Cache refreshed: ${delayed.length} confirmed, ${predicted.length} predicted, ${deduped.length} scanned`);
   } catch(e) {
     cache.lastError = e.message + (e.response?.status ? ` (HTTP ${e.response.status})` : '');
     console.error('Cache refresh failed:', e.message);
   } finally {
     cache.refreshing = false;
+    cache.refreshStartedAt = null;
   }
 }
 
+// Read-time filter: drop any flight whose estimated departure is now in the past
+function liveFilter(list) {
+  const now = Date.now();
+  return list.filter(f => {
+    if (!f.estDepIso) return true;
+    return new Date(f.estDepIso).getTime() > now; // still in the future
+  });
+}
+
 app.get('/api/delays', (req, res) => {
+  const live = liveFilter(cache.data);
   res.json({
     success: true,
-    data: cache.data,
+    data: live,
     total: cache.total,
-    confirmedDelays: cache.confirmedDelays,
-    predictedDelays: cache.predictedDelays,
+    confirmedDelays: live.filter(f => !f.predicted).length,
+    predictedDelays: live.filter(f => f.predicted).length,
     lastUpdated: cache.lastUpdated,
     refreshing: cache.refreshing,
     lastError: cache.lastError,
@@ -282,8 +285,11 @@ app.get('/api/delays', (req, res) => {
 });
 
 app.get('/api/force-refresh', async (req, res) => {
+  // Allow forcing even if stuck flag is set
+  cache.refreshing = false;
+  cache.refreshStartedAt = null;
   refreshCache();
-  res.json({ success: true, message: 'Refresh started in background. Full scan takes 10-15 min.' });
+  res.json({ success: true, message: 'Refresh started. Full scan takes 10-15 min.' });
 });
 
 app.get('*', (req, res) => {
