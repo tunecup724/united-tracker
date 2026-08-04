@@ -17,7 +17,6 @@ const REFRESH_INTERVAL_MIN = 30;
 const CALL_GAP_MS = 7000;
 const SCAN_TIMEOUT_MS = 20 * 60 * 1000;
 
-// Quiet hours: no scanning 2AM–8AM Eastern
 const QUIET_START_HOUR = 2;
 const QUIET_END_HOUR = 8;
 
@@ -190,7 +189,6 @@ async function attachInbound(flight) {
 }
 
 async function refreshCache() {
-  // Skip during quiet hours
   if (isQuietHours()) {
     cache.quietHours = true;
     console.log('Quiet hours (2AM-8AM ET) — skipping scan');
@@ -272,7 +270,6 @@ async function refreshCache() {
   }
 }
 
-// Drop flights whose estimated departure has already passed
 function liveFilter(list) {
   const now = Date.now();
   return list.filter(f => {
@@ -280,6 +277,33 @@ function liveFilter(list) {
     return new Date(f.estDepIso).getTime() > now;
   });
 }
+
+// KEY TEST — two isolated calls, no throttle, no loops
+app.get('/api/keytest', async (req, res) => {
+  const out = {};
+  try {
+    const r = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
+      headers: { 'x-apikey': FA_KEY },
+      params: { max_pages: 1 },
+      timeout: 20000
+    });
+    out.operatorTest = { status: r.status, count: (r.data?.scheduled || []).length };
+  } catch(e) {
+    out.operatorTest = { error: e.response?.status || e.message, body: e.response?.data };
+  }
+  try {
+    const r2 = await axios.get(`${FA_URL}/airports/KORD`, {
+      headers: { 'x-apikey': FA_KEY },
+      timeout: 20000
+    });
+    out.airportTest = { status: r2.status, name: r2.data?.name };
+  } catch(e) {
+    out.airportTest = { error: e.response?.status || e.message, body: e.response?.data };
+  }
+  out.keyPreview = FA_KEY ? `${FA_KEY.slice(0,4)}...${FA_KEY.slice(-4)} (len ${FA_KEY.length})` : 'MISSING';
+  out.keyFromEnv = !!process.env.FA_KEY;
+  res.json(out);
+});
 
 app.get('/api/delays', (req, res) => {
   const live = liveFilter(cache.data);
