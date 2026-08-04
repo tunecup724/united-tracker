@@ -9,13 +9,17 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
-const FA_KEY = '7s7aNdZg9AzDzG3QA5oJ0GdpaCpjjTdt';
+const FA_KEY = process.env.FA_KEY || 'oJr6tdNWilpJRBsIrnTzKDQpXJFfqwyl';
 const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
 const TURNAROUND_MIN = 35;
 const REFRESH_INTERVAL_MIN = 30;
 const CALL_GAP_MS = 7000;
-const SCAN_TIMEOUT_MS = 20 * 60 * 1000; // 20 min — abandon a scan that runs longer
+const SCAN_TIMEOUT_MS = 20 * 60 * 1000;
+
+// Quiet hours: no scanning 2AM–8AM Eastern
+const QUIET_START_HOUR = 2;
+const QUIET_END_HOUR = 8;
 
 const OPERATORS = ['UAL', 'SKW', 'RPA', 'GJS', 'AWI'];
 
@@ -28,8 +32,16 @@ let cache = {
   refreshing: false,
   refreshStartedAt: null,
   lastError: null,
-  operatorStats: {}
+  operatorStats: {},
+  quietHours: false
 };
+
+function isQuietHours() {
+  const etHour = parseInt(new Date().toLocaleString('en-US', {
+    timeZone: 'America/New_York', hour: '2-digit', hour12: false
+  }));
+  return etHour >= QUIET_START_HOUR && etHour < QUIET_END_HOUR;
+}
 
 let lastCallTime = 0;
 async function throttledGet(url, params) {
@@ -72,7 +84,6 @@ async function fetchOperatorFlights(operator, maxPageLoops = 40) {
   try {
     const r = await throttledGet(`${FA_URL}/operators/${operator}/flights/scheduled`, { max_pages: 20 });
     flights.push(...(r.data?.scheduled || []));
-
     let nextLink = r.data?.links?.next;
     let loops = 1;
     while (nextLink && loops < maxPageLoops) {
@@ -99,10 +110,7 @@ async function fetchAllFlights() {
     const uaFlights = [];
     for (const f of flights) {
       const uaIdent = getUAIdent(f);
-      if (uaIdent) {
-        f._uaIdent = uaIdent;
-        uaFlights.push(f);
-      }
+      if (uaIdent) { f._uaIdent = uaIdent; uaFlights.push(f); }
     }
     stats[op] = { fetched: flights.length, uaCoded: uaFlights.length, error: error || null };
     all.push(...uaFlights);
@@ -151,7 +159,6 @@ function mapFlight(f, extra = {}) {
     status: f.status || '—',
     operatedBy: f.operator || '—',
     risk,
-    // Keep ISO fields so the read-time filter can drop departed flights
     estDepIso: f.estimated_out || f.estimated_off || f.scheduled_out,
     schedDepIso: f.scheduled_out,
     _inboundId: f.inbound_fa_flight_id || null,
@@ -183,12 +190,18 @@ async function attachInbound(flight) {
 }
 
 async function refreshCache() {
-  // Stuck-scan guard: if a scan has been "refreshing" longer than the timeout, abandon it
+  // Skip during quiet hours
+  if (isQuietHours()) {
+    cache.quietHours = true;
+    console.log('Quiet hours (2AM-8AM ET) — skipping scan');
+    return;
+  }
+  cache.quietHours = false;
+
   if (cache.refreshing) {
     const running = cache.refreshStartedAt ? (Date.now() - cache.refreshStartedAt) : 0;
-    if (running < SCAN_TIMEOUT_MS) return;      // still legitimately running
+    if (running < SCAN_TIMEOUT_MS) return;
     console.warn(`Abandoning stuck scan (running ${Math.round(running/60000)}m)`);
-    // fall through and start a new one
   }
   cache.refreshing = true;
   cache.refreshStartedAt = Date.now();
@@ -259,12 +272,12 @@ async function refreshCache() {
   }
 }
 
-// Read-time filter: drop any flight whose estimated departure is now in the past
+// Drop flights whose estimated departure has already passed
 function liveFilter(list) {
   const now = Date.now();
   return list.filter(f => {
     if (!f.estDepIso) return true;
-    return new Date(f.estDepIso).getTime() > now; // still in the future
+    return new Date(f.estDepIso).getTime() > now;
   });
 }
 
@@ -278,6 +291,7 @@ app.get('/api/delays', (req, res) => {
     predictedDelays: live.filter(f => f.predicted).length,
     lastUpdated: cache.lastUpdated,
     refreshing: cache.refreshing,
+    quietHours: isQuietHours(),
     lastError: cache.lastError,
     operatorStats: cache.operatorStats,
     timestamp: new Date().toISOString()
@@ -285,7 +299,6 @@ app.get('/api/delays', (req, res) => {
 });
 
 app.get('/api/force-refresh', async (req, res) => {
-  // Allow forcing even if stuck flag is set
   cache.refreshing = false;
   cache.refreshStartedAt = null;
   refreshCache();
