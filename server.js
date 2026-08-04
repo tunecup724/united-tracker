@@ -14,8 +14,10 @@ const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
 const TURNAROUND_MIN = 35;
 const REFRESH_INTERVAL_MIN = 30;
-const CALL_GAP_MS = 7000;
-const SCAN_TIMEOUT_MS = 20 * 60 * 1000;
+const CALL_GAP_MS = 9000;          // widened from 7s
+const MAX_RETRIES = 5;             // retry a 429 instead of abandoning
+const BACKOFF_BASE_MS = 20000;     // first backoff wait
+const SCAN_TIMEOUT_MS = 30 * 60 * 1000;
 
 const QUIET_START_HOUR = 2;
 const QUIET_END_HOUR = 8;
@@ -32,7 +34,8 @@ let cache = {
   refreshStartedAt: null,
   lastError: null,
   operatorStats: {},
-  quietHours: false
+  quietHours: false,
+  rateLimitHits: 0
 };
 
 function isQuietHours() {
@@ -42,12 +45,28 @@ function isQuietHours() {
   return etHour >= QUIET_START_HOUR && etHour < QUIET_END_HOUR;
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 let lastCallTime = 0;
-async function throttledGet(url, params) {
+// Throttled GET with exponential backoff on 429
+async function throttledGet(url, params, attempt = 0) {
   const wait = CALL_GAP_MS - (Date.now() - lastCallTime);
-  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  if (wait > 0) await sleep(wait);
   lastCallTime = Date.now();
-  return axios.get(url, { headers: { 'x-apikey': FA_KEY }, params, timeout: 30000 });
+  try {
+    return await axios.get(url, { headers: { 'x-apikey': FA_KEY }, params, timeout: 30000 });
+  } catch (e) {
+    const status = e.response?.status;
+    if (status === 429 && attempt < MAX_RETRIES) {
+      cache.rateLimitHits++;
+      const backoff = BACKOFF_BASE_MS * Math.pow(2, attempt); // 20s, 40s, 80s, 160s, 320s
+      console.warn(`429 — backing off ${backoff/1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      await sleep(backoff);
+      lastCallTime = 0; // reset so the gap doesn't double-wait
+      return throttledGet(url, params, attempt + 1);
+    }
+    throw e;
+  }
 }
 
 function fmtTime(isoStr, timezone) {
@@ -88,12 +107,18 @@ async function fetchOperatorFlights(operator, maxPageLoops = 40) {
     while (nextLink && loops < maxPageLoops) {
       const cursorMatch = nextLink.match(/cursor=([^&]+)/);
       if (!cursorMatch) break;
-      const r2 = await throttledGet(`${FA_URL}/operators/${operator}/flights/scheduled`, { max_pages: 20, cursor: cursorMatch[1] });
-      const batch = r2.data?.scheduled || [];
-      flights.push(...batch);
-      nextLink = r2.data?.links?.next;
+      try {
+        const r2 = await throttledGet(`${FA_URL}/operators/${operator}/flights/scheduled`, { max_pages: 20, cursor: cursorMatch[1] });
+        const batch = r2.data?.scheduled || [];
+        flights.push(...batch);
+        nextLink = r2.data?.links?.next;
+        if (batch.length === 0) break;
+      } catch (pageErr) {
+        // keep whatever we already fetched for this operator
+        error = pageErr.response?.status ? `HTTP ${pageErr.response.status} (partial)` : pageErr.message;
+        break;
+      }
       loops++;
-      if (batch.length === 0) break;
     }
   } catch(e) {
     error = e.response?.status ? `HTTP ${e.response.status}` : e.message;
@@ -203,6 +228,7 @@ async function refreshCache() {
   }
   cache.refreshing = true;
   cache.refreshStartedAt = Date.now();
+  cache.rateLimitHits = 0;
   console.log('Cache refresh started at', new Date().toISOString());
 
   try {
@@ -260,7 +286,7 @@ async function refreshCache() {
     cache.lastError = null;
     cache.operatorStats = stats;
 
-    console.log(`Cache refreshed: ${delayed.length} confirmed, ${predicted.length} predicted, ${deduped.length} scanned`);
+    console.log(`Cache refreshed: ${delayed.length} confirmed, ${predicted.length} predicted, ${deduped.length} scanned, ${cache.rateLimitHits} rate-limit backoffs`);
   } catch(e) {
     cache.lastError = e.message + (e.response?.status ? ` (HTTP ${e.response.status})` : '');
     console.error('Cache refresh failed:', e.message);
@@ -278,27 +304,15 @@ function liveFilter(list) {
   });
 }
 
-// KEY TEST — two isolated calls, no throttle, no loops
 app.get('/api/keytest', async (req, res) => {
   const out = {};
   try {
     const r = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
-      headers: { 'x-apikey': FA_KEY },
-      params: { max_pages: 1 },
-      timeout: 20000
+      headers: { 'x-apikey': FA_KEY }, params: { max_pages: 1 }, timeout: 20000
     });
     out.operatorTest = { status: r.status, count: (r.data?.scheduled || []).length };
   } catch(e) {
-    out.operatorTest = { error: e.response?.status || e.message, body: e.response?.data };
-  }
-  try {
-    const r2 = await axios.get(`${FA_URL}/airports/KORD`, {
-      headers: { 'x-apikey': FA_KEY },
-      timeout: 20000
-    });
-    out.airportTest = { status: r2.status, name: r2.data?.name };
-  } catch(e) {
-    out.airportTest = { error: e.response?.status || e.message, body: e.response?.data };
+    out.operatorTest = { error: e.response?.status || e.message };
   }
   out.keyPreview = FA_KEY ? `${FA_KEY.slice(0,4)}...${FA_KEY.slice(-4)} (len ${FA_KEY.length})` : 'MISSING';
   out.keyFromEnv = !!process.env.FA_KEY;
@@ -316,6 +330,7 @@ app.get('/api/delays', (req, res) => {
     lastUpdated: cache.lastUpdated,
     refreshing: cache.refreshing,
     quietHours: isQuietHours(),
+    rateLimitHits: cache.rateLimitHits,
     lastError: cache.lastError,
     operatorStats: cache.operatorStats,
     timestamp: new Date().toISOString()
@@ -326,7 +341,7 @@ app.get('/api/force-refresh', async (req, res) => {
   cache.refreshing = false;
   cache.refreshStartedAt = null;
   refreshCache();
-  res.json({ success: true, message: 'Refresh started. Full scan takes 10-15 min.' });
+  res.json({ success: true, message: 'Refresh started. Full scan may take 15-25 min.' });
 });
 
 app.get('*', (req, res) => {
