@@ -291,6 +291,25 @@ function liveFilter(list) {
   });
 }
 
+// RATE TEST - 12 calls at a given gap, reports exactly where it starts failing
+app.get('/api/ratetest', async (req, res) => {
+  const results = [];
+  const gap = parseInt(req.query.gap || '5000');
+  for (let i = 0; i < 12; i++) {
+    const t0 = Date.now();
+    try {
+      const r = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
+        headers: { 'x-apikey': FA_KEY }, params: { max_pages: 1 }, timeout: 15000
+      });
+      results.push({ call: i + 1, status: r.status, count: (r.data?.scheduled || []).length, ms: Date.now() - t0 });
+    } catch (e) {
+      results.push({ call: i + 1, error: e.response?.status || e.message, ms: Date.now() - t0 });
+    }
+    if (i < 11) await sleep(gap);
+  }
+  res.json({ gapMs: gap, results });
+});
+
 app.get('/api/keytest', async (req, res) => {
   const out = {};
   try {
