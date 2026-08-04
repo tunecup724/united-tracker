@@ -1,355 +1,317 @@
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const path = require('path');
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>United Delay Tracker</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #07090f; color: #e2e8f0; font-family: system-ui, sans-serif; min-height: 100vh; }
+  .topbar { background: #0a1628; border-bottom: 1px solid #1a2a45; padding: 14px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; position: sticky; top: 0; z-index: 10; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .badge { background: #0066cc; color: #fff; font-family: monospace; font-weight: 800; font-size: 13px; padding: 5px 11px; border-radius: 3px; }
+  .title { font-size: 16px; font-weight: 700; color: #fff; }
+  .sub { font-size: 11px; color: #4a6080; font-family: monospace; margin-top: 2px; }
+  .btn { background: #0066cc; border: none; color: #fff; font-family: monospace; font-weight: 700; font-size: 12px; padding: 9px 20px; border-radius: 5px; cursor: pointer; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; background: #1a2a45; }
+  .main { padding: 18px; }
+  .prog { background: rgba(0,102,204,0.08); border: 1px solid rgba(0,102,204,0.2); border-radius: 6px; padding: 10px 14px; color: #4a90d0; font-family: monospace; font-size: 11px; margin-bottom: 14px; }
+  .err { background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); border-radius: 6px; padding: 11px 14px; color: #ef4444; font-family: monospace; font-size: 11px; margin-bottom: 14px; }
+  .stats { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+  .stat { background: #0d1829; border-radius: 8px; padding: 12px 16px; flex: 1; min-width: 90px; }
+  .stat-val { font-family: monospace; font-size: 24px; font-weight: 800; line-height: 1; }
+  .stat-lbl { font-size: 10px; color: #4a6080; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .color-guide { background: #0d1829; border: 1px solid #1a2a45; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+  .color-guide-title { font-size: 11px; font-weight: 700; color: #4a6080; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px; }
+  .color-items { display: flex; flex-direction: column; gap: 8px; }
+  .color-item { display: flex; align-items: flex-start; gap: 10px; }
+  .color-dot { width: 12px; height: 12px; border-radius: 2px; flex-shrink: 0; margin-top: 2px; }
+  .color-text { font-size: 12px; color: #e2e8f0; line-height: 1.4; }
+  .color-text b { color: #fff; }
+  .filter-section { margin-bottom: 16px; }
+  .filter-title { font-size: 11px; font-weight: 700; color: #4a6080; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+  .airport-tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+  .airport-tab { background: #0d1829; border: 1px solid #1a2a45; color: #8899aa; font-family: monospace; font-size: 11px; font-weight: 700; padding: 5px 10px; border-radius: 4px; cursor: pointer; }
+  .airport-tab.active { background: #0066cc; border-color: #0066cc; color: #fff; }
+  .airport-tab.active-pred { background: #7c3aed; border-color: #7c3aed; color: #fff; }
+  .airport-tab .count { background: rgba(255,255,255,0.2); border-radius: 10px; padding: 1px 5px; margin-left: 4px; font-size: 10px; }
+  .table-wrap { border-radius: 8px; border: 1px solid #1a2a45; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { background: #0d1829; padding: 10px 12px; text-align: left; font-size: 10px; font-family: monospace; font-weight: 700; color: #4a6080; text-transform: uppercase; border-bottom: 1px solid #1a2a45; white-space: nowrap; }
+  td { padding: 12px; border-bottom: 1px solid #111f35; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  .empty { text-align: center; padding: 60px 20px; color: #4a6080; }
+  .empty-title { color: #e2e8f0; font-weight: 600; margin-bottom: 6px; font-size: 15px; margin-top: 12px; }
+  .row-high { background: rgba(239,68,68,0.07); }
+  .row-high td:first-child { border-left: 3px solid #ef4444; }
+  .row-med { background: rgba(245,158,11,0.07); }
+  .row-med td:first-child { border-left: 3px solid #f59e0b; }
+  .row-low td:first-child { border-left: 3px solid #0066cc; }
+  .row-pred { background: rgba(124,58,237,0.08); }
+  .row-pred td:first-child { border-left: 3px solid #7c3aed; }
+  .jb-btn { display: inline-block; background: #00205b; color: #fff; font-size: 10px; font-weight: 700; font-family: monospace; padding: 5px 10px; border-radius: 4px; text-decoration: none; white-space: nowrap; border: 1px solid #003399; }
+  .slip-bad { background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.3); padding: 3px 8px; border-radius: 4px; font-size: 10px; font-family: monospace; font-weight: 700; white-space: nowrap; }
+  .slip-ok { background: rgba(34,197,94,0.12); color: #22c55e; border: 1px solid rgba(34,197,94,0.25); padding: 3px 8px; border-radius: 4px; font-size: 10px; font-family: monospace; font-weight: 700; white-space: nowrap; }
+  .pred-tag { background: rgba(124,58,237,0.15); color: #a78bfa; border: 1px solid rgba(124,58,237,0.35); padding: 3px 8px; border-radius: 4px; font-size: 10px; font-family: monospace; font-weight: 700; white-space: nowrap; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand">
+    <div class="badge">UA</div>
+    <div>
+      <div class="title">United Delay Tracker</div>
+      <div class="sub">USA · ≤2hr · confirmed + predicted delays · sched 30+ min away</div>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px">
+    <span style="font-family:monospace;font-size:11px;color:#4a6080" id="lastUpdated"></span>
+    <button class="btn" id="refreshBtn" onclick="loadFlights()">↻ REFRESH</button>
+  </div>
+</div>
+<div class="main">
+  <div id="progBox" style="display:none" class="prog"></div>
+  <div id="errBox" style="display:none" class="err"></div>
 
-const app = express();
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+  <div class="stats" id="statsRow" style="display:none">
+    <div class="stat" style="border-top:2px solid #ef4444"><div class="stat-val" style="color:#ef4444" id="s1">0</div><div class="stat-lbl">Confirmed</div></div>
+    <div class="stat" style="border-top:2px solid #7c3aed"><div class="stat-val" style="color:#a78bfa" id="s2">0</div><div class="stat-lbl">Predicted</div></div>
+    <div class="stat" style="border-top:2px solid #f59e0b"><div class="stat-val" style="color:#f59e0b" id="s3">0</div><div class="stat-lbl">Will Slip More</div></div>
+    <div class="stat" style="border-top:2px solid #0066cc"><div class="stat-val" style="color:#4499ee" id="s4">—</div><div class="stat-lbl">Avg Delay</div></div>
+  </div>
 
-const PORT = process.env.PORT || 3000;
-const FA_KEY = process.env.FA_KEY || 'oJr6tdNWilpJRBsIrnTzKDQpXJFfqwyl';
-const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
+  <div class="color-guide" id="colorGuide" style="display:none">
+    <div class="color-guide-title">🎨 What the colors & tags mean</div>
+    <div class="color-items">
+      <div class="color-item"><div class="color-dot" style="background:#ef4444"></div><div class="color-text"><b>Red</b> — Flight is delayed 90+ minutes</div></div>
+      <div class="color-item"><div class="color-dot" style="background:#f59e0b"></div><div class="color-text"><b>Yellow</b> — Flight is delayed 45–89 minutes</div></div>
+      <div class="color-item"><div class="color-dot" style="background:#0066cc"></div><div class="color-text"><b>Blue</b> — Flight is delayed 30–44 minutes</div></div>
+      <div class="color-item"><div class="color-dot" style="background:#7c3aed"></div><div class="color-text"><b>Purple / PREDICTED</b> — United hasn't posted a delay yet, but the inbound plane's arrival makes a 30+ min delay inevitable</div></div>
+      <div class="color-item"><div class="color-dot" style="background:#ef4444;border-radius:50%"></div><div class="color-text"><b>⚠ WILL SLIP</b> — inbound arrives too late to make the current estimated departure (needs ~35 min turnaround), so expect MORE delay</div></div>
+    </div>
+  </div>
 
-const TURNAROUND_MIN = 35;
-const REFRESH_INTERVAL_MIN = 30;
-const CALL_GAP_MS = 9000;          // widened from 7s
-const MAX_RETRIES = 5;             // retry a 429 instead of abandoning
-const BACKOFF_BASE_MS = 20000;     // first backoff wait
-const SCAN_TIMEOUT_MS = 30 * 60 * 1000;
+  <div class="filter-section" id="typeSection" style="display:none">
+    <div class="filter-title">🔮 Delay Type</div>
+    <div class="airport-tabs" id="typeTabs"></div>
+  </div>
 
-const QUIET_START_HOUR = 2;
-const QUIET_END_HOUR = 8;
+  <div class="filter-section" id="filterSection" style="display:none">
+    <div class="filter-title">📍 Filter by Departure Airport</div>
+    <div class="airport-tabs" id="airportTabs"></div>
+  </div>
 
-const OPERATORS = ['UAL', 'SKW', 'RPA', 'GJS', 'AWI'];
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Flight</th><th>Type</th><th>From</th><th>To</th><th>Gate</th>
+          <th>Sched Dep</th><th>Est Dep</th><th>Dep Delay</th>
+          <th>Inbound Impact</th>
+          <th>Inbound Flight</th><th>Inbound From</th><th>Inbound Est Arr</th>
+          <th>Sched Arr</th><th>Est Arr</th>
+          <th>Duration</th><th>Status</th><th>Risk</th><th>Awards</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="18">
+          <div class="empty">
+            <div style="font-size:36px">✈️</div>
+            <div class="empty-title">Hit Refresh to load live data</div>
+            <div style="font-size:11px">Confirmed delays + predicted delays based on inbound aircraft timing.</div>
+          </div>
+        </td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+<script>
+const $id = id => document.getElementById(id);
+const show = (id, html) => { if(html !== undefined) $id(id).innerHTML = html; $id(id).style.display = ''; };
+const hide = id => $id(id).style.display = 'none';
 
-let cache = {
-  data: [],
-  total: 0,
-  confirmedDelays: 0,
-  predictedDelays: 0,
-  lastUpdated: null,
-  refreshing: false,
-  refreshStartedAt: null,
-  lastError: null,
-  operatorStats: {},
-  quietHours: false,
-  rateLimitHits: 0
-};
+let allFlights = [];
+let activeAirport = 'ALL';
+let activeType = 'ALL';
 
-function isQuietHours() {
-  const etHour = parseInt(new Date().toLocaleString('en-US', {
-    timeZone: 'America/New_York', hour: '2-digit', hour12: false
-  }));
-  return etHour >= QUIET_START_HOUR && etHour < QUIET_END_HOUR;
+function badge(mins) {
+  if(!mins || mins <= 0) return '<span style="color:#4a6080">—</span>';
+  const col = mins >= 60 ? '#ef4444' : '#f59e0b';
+  const bg = mins >= 60 ? 'rgba(239,68,68,0.12)' : 'rgba(245,158,11,0.12)';
+  return `<span style="background:${bg};color:${col};padding:2px 7px;border-radius:4px;font-family:monospace;font-size:11px;font-weight:700">+${mins}m</span>`;
 }
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+function riskTag(risk) {
+  const m = {
+    high: ['rgba(239,68,68,0.12)','#ef4444','rgba(239,68,68,0.25)','🔴 90+ MIN'],
+    med:  ['rgba(245,158,11,0.12)','#f59e0b','rgba(245,158,11,0.25)','🟡 45-89 MIN'],
+    low:  ['rgba(0,102,204,0.10)','#4499ee','rgba(0,102,204,0.2)','🔵 30-44 MIN']
+  }[risk];
+  return `<span style="background:${m[0]};color:${m[1]};border:1px solid ${m[2]};padding:3px 8px;border-radius:4px;font-size:10px;font-family:monospace;font-weight:700;white-space:nowrap">${m[3]}</span>`;
+}
 
-let lastCallTime = 0;
-// Throttled GET with exponential backoff on 429
-async function throttledGet(url, params, attempt = 0) {
-  const wait = CALL_GAP_MS - (Date.now() - lastCallTime);
-  if (wait > 0) await sleep(wait);
-  lastCallTime = Date.now();
+function slipCell(f) {
+  if (f.inboundLanded) return '<span class="slip-ok">✅ INBOUND LANDED</span>';
+  if (!f.inboundFlightNum) return '<span style="color:#4a6080">—</span>';
+  if (f.willSlip) return `<span class="slip-bad">⚠ WILL SLIP ~${f.slipMins}m</span>`;
+  return '<span class="slip-ok">✓ ON TRACK</span>';
+}
+
+function typeCell(f) {
+  return f.predicted
+    ? '<span class="pred-tag">🔮 PREDICTED</span>'
+    : '<span style="font-family:monospace;font-size:10px;color:#8899aa">CONFIRMED</span>';
+}
+
+function pill(s) {
+  const d=(s||'').toLowerCase().includes('delay');
+  const c=d?'#ef4444':'#64748b';
+  const bg=d?'rgba(239,68,68,0.12)':'rgba(100,116,139,0.12)';
+  return `<span style="background:${bg};color:${c};padding:2px 7px;border-radius:20px;font-size:10px;font-weight:700;text-transform:uppercase">${s||'—'}</span>`;
+}
+
+function fmtDur(m) {
+  if(!m) return '—';
+  const h=Math.floor(m/60), mn=m%60;
+  return h>0?`${h}h ${mn}m`:`${mn}m`;
+}
+
+function getToday() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+function jetblueUrl(origin, dest) {
+  const d = getToday();
+  const [y,mo,day] = d.split('-');
+  return `https://www.jetblue.com/booking/flights?from=${origin}&to=${dest}&depart=${mo}/${day}/${y}&isMultiCity=false&noOfRoute=1&adults=1&children=0&infants=0&usePoints=true`;
+}
+
+function currentFiltered() {
+  let list = allFlights;
+  if (activeType === 'CONFIRMED') list = list.filter(f => !f.predicted);
+  if (activeType === 'PREDICTED') list = list.filter(f => f.predicted);
+  if (activeType === 'SLIP') list = list.filter(f => f.willSlip);
+  if (activeAirport !== 'ALL') list = list.filter(f => f.depAirport === activeAirport);
+  return list;
+}
+
+function buildTypeTabs() {
+  const conf = allFlights.filter(f=>!f.predicted).length;
+  const pred = allFlights.filter(f=>f.predicted).length;
+  const slip = allFlights.filter(f=>f.willSlip).length;
+  $id('typeTabs').innerHTML =
+    `<div class="airport-tab ${activeType==='ALL'?'active':''}" onclick="setType('ALL')">ALL<span class="count">${allFlights.length}</span></div>` +
+    `<div class="airport-tab ${activeType==='CONFIRMED'?'active':''}" onclick="setType('CONFIRMED')">CONFIRMED<span class="count">${conf}</span></div>` +
+    `<div class="airport-tab ${activeType==='PREDICTED'?'active-pred':''}" onclick="setType('PREDICTED')">🔮 PREDICTED<span class="count">${pred}</span></div>` +
+    `<div class="airport-tab ${activeType==='SLIP'?'active':''}" onclick="setType('SLIP')">⚠ WILL SLIP<span class="count">${slip}</span></div>`;
+}
+
+function setType(t) {
+  activeType = t;
+  activeAirport = 'ALL';
+  buildTypeTabs();
+  buildAirportTabs();
+  renderTable(currentFiltered());
+}
+
+function buildAirportTabs() {
+  const base = activeType === 'ALL' ? allFlights :
+    activeType === 'CONFIRMED' ? allFlights.filter(f=>!f.predicted) :
+    activeType === 'PREDICTED' ? allFlights.filter(f=>f.predicted) :
+    allFlights.filter(f=>f.willSlip);
+  const counts = {};
+  base.forEach(f => { counts[f.depAirport] = (counts[f.depAirport] || 0) + 1; });
+  const airports = Object.entries(counts).sort((a,b) => b[1]-a[1]);
+  $id('airportTabs').innerHTML =
+    `<div class="airport-tab ${activeAirport==='ALL'?'active':''}" onclick="setAirport('ALL')">ALL<span class="count">${base.length}</span></div>` +
+    airports.map(([ap, count]) =>
+      `<div class="airport-tab ${activeAirport===ap?'active':''}" onclick="setAirport('${ap}')">${ap}<span class="count">${count}</span></div>`
+    ).join('');
+}
+
+function setAirport(ap) {
+  activeAirport = ap;
+  buildAirportTabs();
+  renderTable(currentFiltered());
+}
+
+function renderTable(flights) {
+  const rowClass = f => f.predicted ? 'row-pred' : (f.risk==='high'?'row-high':f.risk==='med'?'row-med':'row-low');
+  $id('tbody').innerHTML = flights.length === 0
+    ? `<tr><td colspan="18"><div class="empty"><div style="font-size:32px">✅</div><div class="empty-title">No flights match this filter</div></div></td></tr>`
+    : flights.map(f => `<tr class="${rowClass(f)}">
+        <td><b style="font-family:monospace;color:#fff;font-size:14px">${f.flightNum}</b></td>
+        <td>${typeCell(f)}</td>
+        <td><b style="font-family:monospace;color:#fff">${f.depAirport}</b></td>
+        <td><b style="font-family:monospace;color:#fff">${f.dest}</b></td>
+        <td style="font-family:monospace;color:#8899aa">${f.gate}</td>
+        <td style="font-family:monospace;color:#4a6080;text-decoration:line-through">${f.schedDep||'—'}</td>
+        <td style="font-family:monospace;font-weight:700;color:#fff">${f.estDep||'—'}</td>
+        <td>${badge(f.depDelay)}</td>
+        <td>${slipCell(f)}</td>
+        <td><span style="font-family:monospace;font-weight:700;color:#4499ee;font-size:12px">${f.inboundFlightNum||'—'}</span></td>
+        <td><span style="font-family:monospace;color:#8899aa">${f.inboundOrigin||'—'}</span></td>
+        <td><span style="font-family:monospace;font-weight:700;color:${f.inboundLanded?'#22c55e':'#fff'};font-size:11px">${f.inboundLanded?'✅ '+f.inboundActualArr:(f.inboundEstArr||'—')}</span></td>
+        <td style="font-family:monospace;color:#4a6080;text-decoration:line-through">${f.schedArr||'—'}</td>
+        <td style="font-family:monospace;color:#fff">${f.estArr||'—'}</td>
+        <td style="font-family:monospace;color:#8899aa">${fmtDur(f.duration)}</td>
+        <td>${pill(f.status)}</td>
+        <td>${f.predicted ? '<span class="pred-tag">🔮 PRE-DELAY</span>' : riskTag(f.risk)}</td>
+        <td><a href="${jetblueUrl(f.depAirport, f.dest)}" target="_blank" class="jb-btn">✈ JetBlue</a></td>
+      </tr>`).join('');
+}
+
+async function loadFlights() {
+  const btn = $id('refreshBtn');
+  btn.disabled = true; btn.textContent = '⏳ Loading…';
+  hide('errBox');
+
   try {
-    return await axios.get(url, { headers: { 'x-apikey': FA_KEY }, params, timeout: 30000 });
-  } catch (e) {
-    const status = e.response?.status;
-    if (status === 429 && attempt < MAX_RETRIES) {
-      cache.rateLimitHits++;
-      const backoff = BACKOFF_BASE_MS * Math.pow(2, attempt); // 20s, 40s, 80s, 160s, 320s
-      console.warn(`429 — backing off ${backoff/1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
-      await sleep(backoff);
-      lastCallTime = 0; // reset so the gap doesn't double-wait
-      return throttledGet(url, params, attempt + 1);
+    const res = await fetch('/api/delays');
+    if (!res.ok) throw new Error('Server error ' + res.status);
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'Unknown error');
+
+    allFlights = data.data || [];
+    activeAirport = 'ALL';
+    activeType = 'ALL';
+
+    if (allFlights.length > 0) {
+      $id('s1').textContent = data.confirmedDelays ?? allFlights.filter(f=>!f.predicted).length;
+      $id('s2').textContent = data.predictedDelays ?? allFlights.filter(f=>f.predicted).length;
+      $id('s3').textContent = allFlights.filter(f=>f.willSlip).length;
+      const conf = allFlights.filter(f=>!f.predicted);
+      $id('s4').textContent = conf.length ? Math.round(conf.reduce((s,f)=>s+f.depDelay,0)/conf.length) + 'm' : '—';
+      show('statsRow'); show('colorGuide'); show('filterSection'); show('typeSection');
+      buildTypeTabs();
+      buildAirportTabs();
+    } else {
+      hide('statsRow'); hide('colorGuide'); hide('filterSection'); hide('typeSection');
     }
-    throw e;
-  }
-}
 
-function fmtTime(isoStr, timezone) {
-  if (!isoStr) return '—';
-  try {
-    return new Date(isoStr).toLocaleTimeString('en-US', {
-      hour: '2-digit', minute: '2-digit', hour12: true,
-      timeZone: timezone || 'America/New_York'
-    });
-  } catch { return '—'; }
-}
+    renderTable(allFlights);
 
-function getUAIdent(f) {
-  const iata = f.ident_iata || '';
-  if (iata.startsWith('UA')) return iata;
-  const cs = f.codeshares_iata || [];
-  const ua = cs.find(c => typeof c === 'string' && c.startsWith('UA'));
-  return ua || null;
-}
+    const updated = data.lastUpdated ? new Date(data.lastUpdated).toLocaleTimeString() : 'never';
+    const ageMin = data.lastUpdated ? Math.round((Date.now() - new Date(data.lastUpdated)) / 60000) : '?';
+    $id('lastUpdated').textContent = `Data from ${updated} (${ageMin}m ago)`;
 
-async function getInboundFlight(faFlightId) {
-  try {
-    const r = await throttledGet(`${FA_URL}/flights/${faFlightId}`, {});
-    return r.data?.flights?.[0] || null;
+    let statusMsg = `✅ ${data.confirmedDelays} confirmed + ${data.predictedDelays} predicted · ${data.total} scanned`;
+    if (data.refreshing) statusMsg += ' · 🔄 scan running now…';
+    if (data.quietHours) statusMsg += ' · 😴 quiet hours (2-8AM ET)';
+    if (data.rateLimitHits) statusMsg += ` · ${data.rateLimitHits} rate-limit waits`;
+    if (data.lastError) statusMsg += ` · ⚠ ${data.lastError}`;
+    show('progBox', statusMsg);
   } catch(e) {
-    return null;
+    hide('progBox');
+    show('errBox', '⚠ ' + e.message);
   }
+
+  btn.disabled = false; btn.textContent = '↻ REFRESH';
 }
 
-async function fetchOperatorFlights(operator, maxPageLoops = 40) {
-  const flights = [];
-  let error = null;
-  try {
-    const r = await throttledGet(`${FA_URL}/operators/${operator}/flights/scheduled`, { max_pages: 20 });
-    flights.push(...(r.data?.scheduled || []));
-    let nextLink = r.data?.links?.next;
-    let loops = 1;
-    while (nextLink && loops < maxPageLoops) {
-      const cursorMatch = nextLink.match(/cursor=([^&]+)/);
-      if (!cursorMatch) break;
-      try {
-        const r2 = await throttledGet(`${FA_URL}/operators/${operator}/flights/scheduled`, { max_pages: 20, cursor: cursorMatch[1] });
-        const batch = r2.data?.scheduled || [];
-        flights.push(...batch);
-        nextLink = r2.data?.links?.next;
-        if (batch.length === 0) break;
-      } catch (pageErr) {
-        // keep whatever we already fetched for this operator
-        error = pageErr.response?.status ? `HTTP ${pageErr.response.status} (partial)` : pageErr.message;
-        break;
-      }
-      loops++;
-    }
-  } catch(e) {
-    error = e.response?.status ? `HTTP ${e.response.status}` : e.message;
-  }
-  return { flights, error };
-}
-
-async function fetchAllFlights() {
-  const all = [];
-  const stats = {};
-  for (const op of OPERATORS) {
-    const { flights, error } = await fetchOperatorFlights(op);
-    const uaFlights = [];
-    for (const f of flights) {
-      const uaIdent = getUAIdent(f);
-      if (uaIdent) { f._uaIdent = uaIdent; uaFlights.push(f); }
-    }
-    stats[op] = { fetched: flights.length, uaCoded: uaFlights.length, error: error || null };
-    all.push(...uaFlights);
-  }
-  return { flights: all, stats };
-}
-
-function baseEligible(f, now) {
-  if (!f._uaIdent) return false;
-  const statusLower = (f.status || '').toLowerCase();
-  if (f.actual_off) return false;
-  if (statusLower.includes('taxiing') || statusLower.includes('en route') ||
-      statusLower.includes('landed') || statusLower.includes('arrived')) return false;
-  if (!f.scheduled_out) return false;
-  const minsUntilSchedDep = (new Date(f.scheduled_out) - now) / 60000;
-  if (minsUntilSchedDep < 30) return false;
-  if (!f.scheduled_in) return false;
-  const durMins = (new Date(f.scheduled_in) - new Date(f.scheduled_out)) / 60000;
-  if (durMins > 130 || durMins <= 0) return false;
-  return true;
-}
-
-function mapFlight(f, extra = {}) {
-  const tz = f.origin?.timezone || 'America/New_York';
-  const depDelayMins = Math.round((f.departure_delay || 0) / 60);
-  const arrDelayMins = Math.round((f.arrival_delay || 0) / 60);
-  const durMins = Math.round((new Date(f.scheduled_in) - new Date(f.scheduled_out)) / 60000);
-  let risk;
-  if (depDelayMins >= 90) risk = 'high';
-  else if (depDelayMins >= 45) risk = 'med';
-  else risk = 'low';
-  return {
-    flightNum: f._uaIdent,
-    operatedAs: f.ident_iata || f.ident || '—',
-    depAirport: f.origin?.code_iata || '—',
-    dest: f.destination?.code_iata || '—',
-    gate: f.gate_origin || '—',
-    terminal: f.terminal_origin || '—',
-    schedDep: fmtTime(f.scheduled_out, tz),
-    estDep: fmtTime(f.estimated_out || f.estimated_off, tz),
-    schedArr: fmtTime(f.scheduled_in, f.destination?.timezone),
-    estArr: fmtTime(f.estimated_in, f.destination?.timezone),
-    duration: durMins,
-    depDelay: depDelayMins,
-    arrDelay: arrDelayMins,
-    status: f.status || '—',
-    operatedBy: f.operator || '—',
-    risk,
-    estDepIso: f.estimated_out || f.estimated_off || f.scheduled_out,
-    schedDepIso: f.scheduled_out,
-    _inboundId: f.inbound_fa_flight_id || null,
-    _tz: tz,
-    ...extra
-  };
-}
-
-async function attachInbound(flight) {
-  if (!flight._inboundId) return flight;
-  const inb = await getInboundFlight(flight._inboundId);
-  if (!inb) return flight;
-  const tz = flight._tz;
-  const inbEstArrIso = inb.estimated_in || inb.estimated_on || inb.scheduled_in;
-  flight.inboundFlightNum = inb.ident_iata || inb.ident || '—';
-  flight.inboundOrigin = inb.origin?.code_iata || '—';
-  flight.inboundSchedArr = fmtTime(inb.scheduled_in, tz);
-  flight.inboundEstArr = fmtTime(inbEstArrIso, tz);
-  flight.inboundActualArr = fmtTime(inb.actual_in || inb.actual_on, tz);
-  flight.inboundLanded = !!(inb.actual_in || inb.actual_on);
-  if (inbEstArrIso && flight.estDepIso && !flight.inboundLanded) {
-    const readyTime = new Date(inbEstArrIso).getTime() + TURNAROUND_MIN * 60000;
-    const estDepTime = new Date(flight.estDepIso).getTime();
-    const slipMins = Math.round((readyTime - estDepTime) / 60000);
-    if (slipMins > 0) { flight.willSlip = true; flight.slipMins = slipMins; }
-    else { flight.willSlip = false; }
-  }
-  return flight;
-}
-
-async function refreshCache() {
-  if (isQuietHours()) {
-    cache.quietHours = true;
-    console.log('Quiet hours (2AM-8AM ET) — skipping scan');
-    return;
-  }
-  cache.quietHours = false;
-
-  if (cache.refreshing) {
-    const running = cache.refreshStartedAt ? (Date.now() - cache.refreshStartedAt) : 0;
-    if (running < SCAN_TIMEOUT_MS) return;
-    console.warn(`Abandoning stuck scan (running ${Math.round(running/60000)}m)`);
-  }
-  cache.refreshing = true;
-  cache.refreshStartedAt = Date.now();
-  cache.rateLimitHits = 0;
-  console.log('Cache refresh started at', new Date().toISOString());
-
-  try {
-    const now = new Date();
-    const { flights: raw, stats } = await fetchAllFlights();
-
-    const seen = new Set();
-    const deduped = raw.filter(f => {
-      const key = `${f._uaIdent}-${f.scheduled_out}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
-    const eligible = deduped.filter(f => baseEligible(f, now));
-
-    const delayed = eligible
-      .filter(f => (f.departure_delay || 0) >= 1800)
-      .map(f => mapFlight(f, { predicted: false }));
-
-    const candidates = eligible
-      .filter(f => {
-        const depDelay = f.departure_delay || 0;
-        if (depDelay >= 1800) return false;
-        if (!f.inbound_fa_flight_id) return false;
-        return true;
-      })
-      .map(f => mapFlight(f, { predicted: true }));
-
-    const all = [...delayed, ...candidates];
-    for (const f of all) {
-      await attachInbound(f);
-    }
-
-    const predicted = candidates.filter(f => {
-      if (!f.inboundEstArr || f.inboundLanded) return false;
-      if (!f.willSlip) return false;
-      const schedDep = new Date(f.schedDepIso).getTime();
-      const estDep = new Date(f.estDepIso).getTime();
-      const readyTime = estDep + f.slipMins * 60000;
-      return (readyTime - schedDep) / 60000 >= 30;
-    });
-
-    const finalList = [...delayed, ...predicted]
-      .sort((a, b) => {
-        const r = { high: 0, med: 1, low: 2 };
-        return (r[a.risk] - r[b.risk]) || (b.depDelay - a.depDelay);
-      });
-
-    cache.data = finalList;
-    cache.total = deduped.length;
-    cache.confirmedDelays = delayed.length;
-    cache.predictedDelays = predicted.length;
-    cache.lastUpdated = new Date().toISOString();
-    cache.lastError = null;
-    cache.operatorStats = stats;
-
-    console.log(`Cache refreshed: ${delayed.length} confirmed, ${predicted.length} predicted, ${deduped.length} scanned, ${cache.rateLimitHits} rate-limit backoffs`);
-  } catch(e) {
-    cache.lastError = e.message + (e.response?.status ? ` (HTTP ${e.response.status})` : '');
-    console.error('Cache refresh failed:', e.message);
-  } finally {
-    cache.refreshing = false;
-    cache.refreshStartedAt = null;
-  }
-}
-
-function liveFilter(list) {
-  const now = Date.now();
-  return list.filter(f => {
-    if (!f.estDepIso) return true;
-    return new Date(f.estDepIso).getTime() > now;
-  });
-}
-
-app.get('/api/keytest', async (req, res) => {
-  const out = {};
-  try {
-    const r = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
-      headers: { 'x-apikey': FA_KEY }, params: { max_pages: 1 }, timeout: 20000
-    });
-    out.operatorTest = { status: r.status, count: (r.data?.scheduled || []).length };
-  } catch(e) {
-    out.operatorTest = { error: e.response?.status || e.message };
-  }
-  out.keyPreview = FA_KEY ? `${FA_KEY.slice(0,4)}...${FA_KEY.slice(-4)} (len ${FA_KEY.length})` : 'MISSING';
-  out.keyFromEnv = !!process.env.FA_KEY;
-  res.json(out);
-});
-
-app.get('/api/delays', (req, res) => {
-  const live = liveFilter(cache.data);
-  res.json({
-    success: true,
-    data: live,
-    total: cache.total,
-    confirmedDelays: live.filter(f => !f.predicted).length,
-    predictedDelays: live.filter(f => f.predicted).length,
-    lastUpdated: cache.lastUpdated,
-    refreshing: cache.refreshing,
-    quietHours: isQuietHours(),
-    rateLimitHits: cache.rateLimitHits,
-    lastError: cache.lastError,
-    operatorStats: cache.operatorStats,
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.get('/api/force-refresh', async (req, res) => {
-  cache.refreshing = false;
-  cache.refreshStartedAt = null;
-  refreshCache();
-  res.json({ success: true, message: 'Refresh started. Full scan may take 15-25 min.' });
-});
-
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  refreshCache();
-  setInterval(refreshCache, REFRESH_INTERVAL_MIN * 60 * 1000);
-});
+// Auto-load on page open
+loadFlights();
+</script>
+</body>
+</html>
