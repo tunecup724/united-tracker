@@ -15,9 +15,14 @@ const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 const TURNAROUND_MIN = 35;
 const REFRESH_INTERVAL_MIN = 30;
 const CALL_GAP_MS = 9000;
-const MAX_RETRIES = 5;
+const MAX_RETRIES = 4;
 const BACKOFF_BASE_MS = 20000;
 const SCAN_TIMEOUT_MS = 45 * 60 * 1000;
+
+// Cap pagination - early pages hold the near-term flights we care about
+const MAX_PAGE_LOOPS = 8;
+// Stop paginating once flights are this far in the future (hours)
+const HORIZON_HOURS = 14;
 
 const QUIET_START_HOUR = 2;
 const QUIET_END_HOUR = 8;
@@ -30,6 +35,9 @@ let cache = {
   lastError: null, operatorStats: {}, quietHours: false, rateLimitHits: 0,
   scanProgress: ''
 };
+
+// Live accumulators so we can commit mid-scan
+let acc = { confirmed: [], predicted: [], seen: new Set(), totalScanned: 0, stats: {} };
 
 function isQuietHours() {
   const etHour = parseInt(new Date().toLocaleString('en-US', {
@@ -52,7 +60,7 @@ async function throttledGet(url, params, attempt = 0) {
     if (status === 429 && attempt < MAX_RETRIES) {
       cache.rateLimitHits++;
       const backoff = BACKOFF_BASE_MS * Math.pow(2, attempt);
-      console.warn(`429 - backing off ${backoff/1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      console.warn(`429 - backing off ${backoff/1000}s`);
       await sleep(backoff);
       lastCallTime = 0;
       return throttledGet(url, params, attempt + 1);
@@ -84,36 +92,6 @@ async function getInboundFlight(faFlightId) {
     const r = await throttledGet(`${FA_URL}/flights/${faFlightId}`, {});
     return r.data?.flights?.[0] || null;
   } catch(e) { return null; }
-}
-
-async function fetchOperatorFlights(operator, maxPageLoops = 40) {
-  const flights = [];
-  let error = null;
-  try {
-    const r = await throttledGet(`${FA_URL}/operators/${operator}/flights/scheduled`, { max_pages: 20 });
-    flights.push(...(r.data?.scheduled || []));
-    let nextLink = r.data?.links?.next;
-    let loops = 1;
-    while (nextLink && loops < maxPageLoops) {
-      const cursorMatch = nextLink.match(/cursor=([^&]+)/);
-      if (!cursorMatch) break;
-      try {
-        const r2 = await throttledGet(`${FA_URL}/operators/${operator}/flights/scheduled`, { max_pages: 20, cursor: cursorMatch[1] });
-        const batch = r2.data?.scheduled || [];
-        flights.push(...batch);
-        nextLink = r2.data?.links?.next;
-        cache.scanProgress = `${operator}: ${flights.length} flights fetched`;
-        if (batch.length === 0) break;
-      } catch (pageErr) {
-        error = pageErr.response?.status ? `HTTP ${pageErr.response.status} (partial)` : pageErr.message;
-        break;
-      }
-      loops++;
-    }
-  } catch(e) {
-    error = e.response?.status ? `HTTP ${e.response.status}` : e.message;
-  }
-  return { flights, error };
 }
 
 function baseEligible(f, now) {
@@ -187,23 +165,90 @@ async function attachInbound(flight) {
   return flight;
 }
 
-function commitToCache(confirmedList, predictedList, totalScanned, stats) {
-  const finalList = [...confirmedList, ...predictedList].sort((a, b) => {
+function commit() {
+  const finalList = [...acc.confirmed, ...acc.predicted].sort((a, b) => {
     const r = { high: 0, med: 1, low: 2 };
     return (r[a.risk] - r[b.risk]) || (b.depDelay - a.depDelay);
   });
   cache.data = finalList;
-  cache.total = totalScanned;
-  cache.confirmedDelays = confirmedList.length;
-  cache.predictedDelays = predictedList.length;
+  cache.total = acc.totalScanned;
+  cache.confirmedDelays = acc.confirmed.length;
+  cache.predictedDelays = acc.predicted.length;
   cache.lastUpdated = new Date().toISOString();
-  cache.operatorStats = stats;
+  cache.operatorStats = acc.stats;
+}
+
+// Process a batch of raw flights into the accumulators, then commit
+function ingest(flights, now) {
+  for (const f of flights) {
+    const uaIdent = getUAIdent(f);
+    if (!uaIdent) continue;
+    f._uaIdent = uaIdent;
+    const key = `${uaIdent}-${f.scheduled_out}`;
+    if (acc.seen.has(key)) continue;
+    acc.seen.add(key);
+    acc.totalScanned++;
+    if (!baseEligible(f, now)) continue;
+    if ((f.departure_delay || 0) >= 1800) {
+      acc.confirmed.push(mapFlight(f, { predicted: false }));
+    } else if (f.inbound_fa_flight_id) {
+      f._candidate = mapFlight(f, { predicted: true });
+      acc.candidates = acc.candidates || [];
+      acc.candidates.push(f._candidate);
+    }
+  }
+  commit();
+}
+
+// Fetch one operator, committing after every page
+async function fetchOperatorProgressive(operator) {
+  let fetched = 0;
+  let error = null;
+  const horizonMs = Date.now() + HORIZON_HOURS * 3600 * 1000;
+  try {
+    const r = await throttledGet(`${FA_URL}/operators/${operator}/flights/scheduled`, { max_pages: 20 });
+    let batch = r.data?.scheduled || [];
+    fetched += batch.length;
+    ingest(batch, new Date());
+    cache.scanProgress = `${operator}: ${fetched} fetched, ${acc.confirmed.length} confirmed`;
+
+    let nextLink = r.data?.links?.next;
+    let loops = 1;
+    while (nextLink && loops < MAX_PAGE_LOOPS) {
+      const cursorMatch = nextLink.match(/cursor=([^&]+)/);
+      if (!cursorMatch) break;
+      try {
+        const r2 = await throttledGet(`${FA_URL}/operators/${operator}/flights/scheduled`, { max_pages: 20, cursor: cursorMatch[1] });
+        batch = r2.data?.scheduled || [];
+        if (batch.length === 0) break;
+        fetched += batch.length;
+        ingest(batch, new Date());
+        cache.scanProgress = `${operator}: ${fetched} fetched, ${acc.confirmed.length} confirmed`;
+
+        // Stop if we've paginated past the useful horizon
+        const lastSched = batch[batch.length - 1]?.scheduled_out;
+        if (lastSched && new Date(lastSched).getTime() > horizonMs) {
+          console.log(`${operator}: reached ${HORIZON_HOURS}h horizon, stopping pagination`);
+          break;
+        }
+        nextLink = r2.data?.links?.next;
+      } catch (pageErr) {
+        error = pageErr.response?.status ? `HTTP ${pageErr.response.status} (partial)` : pageErr.message;
+        break;
+      }
+      loops++;
+    }
+  } catch(e) {
+    error = e.response?.status ? `HTTP ${e.response.status}` : e.message;
+  }
+  acc.stats[operator] = { fetched, error: error || null };
+  commit();
+  return fetched;
 }
 
 async function refreshCache() {
   if (isQuietHours()) {
     cache.quietHours = true;
-    console.log('Quiet hours - skipping scan');
     return;
   }
   cache.quietHours = false;
@@ -211,96 +256,63 @@ async function refreshCache() {
   if (cache.refreshing) {
     const running = cache.refreshStartedAt ? (Date.now() - cache.refreshStartedAt) : 0;
     if (running < SCAN_TIMEOUT_MS) return;
-    console.warn(`Abandoning stuck scan (${Math.round(running/60000)}m)`);
+    console.warn('Abandoning stuck scan');
   }
   cache.refreshing = true;
   cache.refreshStartedAt = Date.now();
   cache.rateLimitHits = 0;
   cache.scanProgress = 'starting';
+
+  // Fresh accumulators each scan
+  acc = { confirmed: [], predicted: [], candidates: [], seen: new Set(), totalScanned: 0, stats: {} };
+
   console.log('Scan started', new Date().toISOString());
 
-  // Accumulators that persist across the whole scan
-  const allConfirmed = [];
-  const allCandidates = [];
-  const stats = {};
-  const seen = new Set();
-  let totalScanned = 0;
-
   try {
-    // PHASE 1: fetch each operator, commit results as we go
+    // PHASE 1 - fetch all operators, committing after every page
     for (const op of OPERATORS) {
-      cache.scanProgress = `fetching ${op}`;
-      const { flights, error } = await fetchOperatorFlights(op);
-
-      const uaFlights = [];
-      for (const f of flights) {
-        const uaIdent = getUAIdent(f);
-        if (uaIdent) { f._uaIdent = uaIdent; uaFlights.push(f); }
-      }
-      stats[op] = { fetched: flights.length, uaCoded: uaFlights.length, error: error || null };
-
-      const now = new Date();
-      const deduped = uaFlights.filter(f => {
-        const key = `${f._uaIdent}-${f.scheduled_out}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-      totalScanned += deduped.length;
-
-      const eligible = deduped.filter(f => baseEligible(f, now));
-
-      eligible
-        .filter(f => (f.departure_delay || 0) >= 1800)
-        .forEach(f => allConfirmed.push(mapFlight(f, { predicted: false })));
-
-      eligible
-        .filter(f => (f.departure_delay || 0) < 1800 && f.inbound_fa_flight_id)
-        .forEach(f => allCandidates.push(mapFlight(f, { predicted: true })));
-
-      // COMMIT NOW - confirmed delays visible immediately after each operator
-      commitToCache(allConfirmed, [], totalScanned, stats);
-      console.log(`${op} done: ${allConfirmed.length} confirmed so far, ${totalScanned} scanned`);
-      cache.scanProgress = `${op} done - ${allConfirmed.length} confirmed`;
+      await fetchOperatorProgressive(op);
+      console.log(`${op} done. Confirmed so far: ${acc.confirmed.length}`);
     }
 
-    // PHASE 2: inbound lookups for confirmed delays first (most useful)
-    cache.scanProgress = 'checking inbounds for confirmed delays';
-    for (let i = 0; i < allConfirmed.length; i++) {
-      await attachInbound(allConfirmed[i]);
-      if (i % 5 === 0) {
-        commitToCache(allConfirmed, [], totalScanned, stats);
-        cache.scanProgress = `inbound ${i + 1}/${allConfirmed.length} (confirmed)`;
+    // PHASE 2 - inbound for confirmed delays
+    cache.scanProgress = `inbound lookups: ${acc.confirmed.length} confirmed`;
+    for (let i = 0; i < acc.confirmed.length; i++) {
+      await attachInbound(acc.confirmed[i]);
+      if (i % 3 === 0) {
+        commit();
+        cache.scanProgress = `inbound ${i + 1}/${acc.confirmed.length} (confirmed)`;
       }
     }
-    commitToCache(allConfirmed, [], totalScanned, stats);
+    commit();
 
-    // PHASE 3: inbound lookups for predicted candidates, committing progressively
-    const predicted = [];
-    cache.scanProgress = `checking ${allCandidates.length} candidates for predicted delays`;
-    for (let i = 0; i < allCandidates.length; i++) {
-      const f = allCandidates[i];
+    // PHASE 3 - inbound for predicted candidates
+    const cands = acc.candidates || [];
+    cache.scanProgress = `checking ${cands.length} candidates for predictions`;
+    for (let i = 0; i < cands.length; i++) {
+      const f = cands[i];
       await attachInbound(f);
       if (f.inboundEstArr && !f.inboundLanded && f.willSlip) {
         const schedDep = new Date(f.schedDepIso).getTime();
         const estDep = new Date(f.estDepIso).getTime();
         const readyTime = estDep + f.slipMins * 60000;
-        if ((readyTime - schedDep) / 60000 >= 30) predicted.push(f);
+        if ((readyTime - schedDep) / 60000 >= 30) {
+          acc.predicted.push(f);
+        }
       }
-      if (i % 5 === 0) {
-        commitToCache(allConfirmed, predicted, totalScanned, stats);
-        cache.scanProgress = `inbound ${i + 1}/${allCandidates.length} (predicted) - ${predicted.length} found`;
+      if (i % 3 === 0) {
+        commit();
+        cache.scanProgress = `inbound ${i + 1}/${cands.length} (predicted) - ${acc.predicted.length} found`;
       }
     }
 
-    commitToCache(allConfirmed, predicted, totalScanned, stats);
+    commit();
     cache.lastError = null;
     cache.scanProgress = 'complete';
-    console.log(`Scan complete: ${allConfirmed.length} confirmed, ${predicted.length} predicted, ${totalScanned} scanned, ${cache.rateLimitHits} backoffs`);
+    console.log(`Scan complete: ${acc.confirmed.length} confirmed, ${acc.predicted.length} predicted, ${acc.totalScanned} scanned, ${cache.rateLimitHits} backoffs`);
   } catch(e) {
     cache.lastError = e.message + (e.response?.status ? ` (HTTP ${e.response.status})` : '');
     console.error('Scan failed:', e.message);
-    // keep whatever was committed
   } finally {
     cache.refreshing = false;
     cache.refreshStartedAt = null;
@@ -338,21 +350,7 @@ app.get('/api/force-refresh', (req, res) => {
   cache.refreshing = false;
   cache.refreshStartedAt = null;
   refreshCache();
-  res.json({ success: true, message: 'Scan started. Confirmed delays appear within a few minutes.' });
-});
-
-app.get('/api/keytest', async (req, res) => {
-  const out = {};
-  try {
-    const r = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
-      headers: { 'x-apikey': FA_KEY }, params: { max_pages: 1 }, timeout: 20000
-    });
-    out.operatorTest = { status: r.status, count: (r.data?.scheduled || []).length };
-  } catch(e) {
-    out.operatorTest = { error: e.response?.status || e.message };
-  }
-  out.keyPreview = FA_KEY ? `${FA_KEY.slice(0,4)}...${FA_KEY.slice(-4)}` : 'MISSING';
-  res.json(out);
+  res.json({ success: true, message: 'Scan started. Flights appear within 1-2 minutes.' });
 });
 
 app.get('*', (req, res) => {
