@@ -17,15 +17,16 @@ const AUTO_INTERVAL_MIN = 30;
 const CALL_GAP_MS = 9000;
 const MAX_RETRIES = 4;
 const BACKOFF_BASE_MS = 20000;
-const SCAN_TIMEOUT_MS = 45 * 60 * 1000;
-const MAX_DATA_AGE_MS = 2 * 60 * 60 * 1000;   // discard cache older than 2 hours
+const SCAN_TIMEOUT_MS = 90 * 60 * 1000;
+const MAX_DATA_AGE_MS = 2 * 60 * 60 * 1000;
 
-const MAX_PAGE_LOOPS = 8;
-const HORIZON_HOURS = 14;
+// FULL DEPTH - fetch everything
+const MAX_PAGE_LOOPS = 40;
+const HORIZON_HOURS = 48;
 
 const OPERATORS = ['UAL', 'SKW', 'RPA', 'GJS', 'AWI'];
 
-let autoMode = false;          // OFF by default - no scans unless asked
+let autoMode = false;
 let autoTimer = null;
 
 let cache = {
@@ -238,6 +239,7 @@ async function runScan() {
   try {
     for (const op of OPERATORS) {
       await fetchOperatorProgressive(op);
+      console.log(`${op} done. Confirmed so far: ${acc.confirmed.length}`);
     }
 
     cache.scanProgress = `inbound lookups for ${acc.confirmed.length} confirmed`;
@@ -269,7 +271,7 @@ async function runScan() {
     commit();
     cache.lastError = null;
     cache.scanProgress = 'complete';
-    console.log(`Scan complete: ${acc.confirmed.length} confirmed, ${acc.predicted.length} predicted`);
+    console.log(`Scan complete: ${acc.confirmed.length} confirmed, ${acc.predicted.length} predicted, ${acc.totalScanned} scanned`);
   } catch(e) {
     cache.lastError = e.message + (e.response?.status ? ` (HTTP ${e.response.status})` : '');
     console.error('Scan failed:', e.message);
@@ -279,7 +281,6 @@ async function runScan() {
   }
 }
 
-// Drop departed flights AND anything from a stale (2h+) scan
 function liveData() {
   if (!cache.lastUpdated) return [];
   const age = Date.now() - new Date(cache.lastUpdated).getTime();
@@ -324,24 +325,22 @@ app.get('/api/delays', (req, res) => {
   });
 });
 
-// Manual single scan
-app.post('/api/scan', (req, res) => {
-  runScan();
-  res.json({ success: true, message: 'Scan started' });
-});
 app.get('/api/scan', (req, res) => {
   runScan();
   res.json({ success: true, message: 'Scan started' });
 });
+app.post('/api/scan', (req, res) => {
+  runScan();
+  res.json({ success: true, message: 'Scan started' });
+});
 
-// Toggle auto mode
+app.get('/api/auto', (req, res) => {
+  if (req.query.on !== undefined) setAuto(req.query.on === 'true');
+  res.json({ success: true, autoMode });
+});
 app.post('/api/auto', (req, res) => {
   const on = req.query.on === 'true' || req.body?.on === true;
   setAuto(on);
-  res.json({ success: true, autoMode });
-});
-app.get('/api/auto', (req, res) => {
-  if (req.query.on !== undefined) setAuto(req.query.on === 'true');
   res.json({ success: true, autoMode });
 });
 
@@ -354,6 +353,5 @@ process.on('unhandledRejection', (err) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT} - AUTO mode OFF, manual scans only`);
-  // No scan on startup - costs nothing until you ask
+  console.log(`Server running on port ${PORT} - AUTO OFF, manual scans only, FULL DEPTH`);
 });
