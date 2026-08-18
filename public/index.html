@@ -12,10 +12,15 @@
   .badge { background: #0066cc; color: #fff; font-family: monospace; font-weight: 800; font-size: 13px; padding: 5px 11px; border-radius: 3px; }
   .title { font-size: 16px; font-weight: 700; color: #fff; }
   .sub { font-size: 11px; color: #4a6080; font-family: monospace; margin-top: 2px; }
-  .btn { background: #0066cc; border: none; color: #fff; font-family: monospace; font-weight: 700; font-size: 12px; padding: 9px 20px; border-radius: 5px; cursor: pointer; }
+  .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .btn { background: #0066cc; border: none; color: #fff; font-family: monospace; font-weight: 700; font-size: 12px; padding: 9px 18px; border-radius: 5px; cursor: pointer; }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; background: #1a2a45; }
+  .btn-auto-off { background: #1a2a45; border: 1px solid #2a3a55; }
+  .btn-auto-on { background: #16a34a; }
+  .age { font-family: monospace; font-size: 11px; color: #4a6080; }
   .main { padding: 18px; }
   .prog { background: rgba(0,102,204,0.08); border: 1px solid rgba(0,102,204,0.2); border-radius: 6px; padding: 10px 14px; color: #4a90d0; font-family: monospace; font-size: 11px; margin-bottom: 14px; }
+  .warn { background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.25); border-radius: 6px; padding: 10px 14px; color: #f59e0b; font-family: monospace; font-size: 11px; margin-bottom: 14px; }
   .err { background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); border-radius: 6px; padding: 11px 14px; color: #ef4444; font-family: monospace; font-size: 11px; margin-bottom: 14px; }
   .stats { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
   .stat { background: #0d1829; border-radius: 8px; padding: 12px 16px; flex: 1; min-width: 90px; }
@@ -61,16 +66,18 @@
     <div class="badge">UA</div>
     <div>
       <div class="title">United Delay Tracker</div>
-      <div class="sub">USA · &le;2hr · confirmed + predicted delays</div>
+      <div class="sub">manual scans only - data expires after 2h</div>
     </div>
   </div>
-  <div style="display:flex;align-items:center;gap:12px">
-    <span style="font-family:monospace;font-size:11px;color:#4a6080" id="lastUpdated"></span>
-    <button class="btn" id="refreshBtn" onclick="loadFlights()">&#8635; REFRESH</button>
+  <div class="controls">
+    <span class="age" id="lastUpdated"></span>
+    <button class="btn" id="scanBtn" onclick="startScan()">SCAN NOW</button>
+    <button class="btn btn-auto-off" id="autoBtn" onclick="toggleAuto()">AUTO: OFF</button>
   </div>
 </div>
 <div class="main">
   <div id="progBox" style="display:none" class="prog"></div>
+  <div id="warnBox" style="display:none" class="warn"></div>
   <div id="errBox" style="display:none" class="err"></div>
 
   <div class="stats" id="statsRow" style="display:none">
@@ -83,11 +90,11 @@
   <div class="color-guide" id="colorGuide" style="display:none">
     <div class="color-guide-title">What the colors mean</div>
     <div class="color-items">
-      <div class="color-item"><div class="color-dot" style="background:#ef4444"></div><div class="color-text"><b>Red</b> - Flight is delayed 90+ minutes</div></div>
-      <div class="color-item"><div class="color-dot" style="background:#f59e0b"></div><div class="color-text"><b>Yellow</b> - Flight is delayed 45-89 minutes</div></div>
-      <div class="color-item"><div class="color-dot" style="background:#0066cc"></div><div class="color-text"><b>Blue</b> - Flight is delayed 30-44 minutes</div></div>
-      <div class="color-item"><div class="color-dot" style="background:#7c3aed"></div><div class="color-text"><b>Purple / PREDICTED</b> - United hasn't posted a delay yet, but the inbound plane's arrival makes a 30+ min delay likely</div></div>
-      <div class="color-item"><div class="color-dot" style="background:#ef4444;border-radius:50%"></div><div class="color-text"><b>WILL SLIP</b> - inbound arrives too late to make the current estimated departure (needs ~35 min turnaround), so expect more delay</div></div>
+      <div class="color-item"><div class="color-dot" style="background:#ef4444"></div><div class="color-text"><b>Red</b> - delayed 90+ minutes</div></div>
+      <div class="color-item"><div class="color-dot" style="background:#f59e0b"></div><div class="color-text"><b>Yellow</b> - delayed 45-89 minutes</div></div>
+      <div class="color-item"><div class="color-dot" style="background:#0066cc"></div><div class="color-text"><b>Blue</b> - delayed 30-44 minutes</div></div>
+      <div class="color-item"><div class="color-dot" style="background:#7c3aed"></div><div class="color-text"><b>Purple / PREDICTED</b> - no delay posted yet, but the inbound plane's arrival makes a 30+ min delay likely</div></div>
+      <div class="color-item"><div class="color-dot" style="background:#ef4444;border-radius:50%"></div><div class="color-text"><b>WILL SLIP</b> - inbound arrives too late for the current estimated departure (~35 min turnaround), expect more delay</div></div>
     </div>
   </div>
 
@@ -117,8 +124,8 @@
         <tr><td colspan="18">
           <div class="empty">
             <div style="font-size:36px">&#9992;</div>
-            <div class="empty-title">Loading live data...</div>
-            <div style="font-size:11px">Confirmed delays plus predicted delays based on inbound aircraft timing.</div>
+            <div class="empty-title">Tap SCAN NOW to load flights</div>
+            <div style="font-size:11px">Nothing runs in the background - scans only happen when you ask.</div>
           </div>
         </td></tr>
       </tbody>
@@ -133,6 +140,8 @@ const hide = id => $id(id).style.display = 'none';
 let allFlights = [];
 let activeAirport = 'ALL';
 let activeType = 'ALL';
+let pollTimer = null;
+let autoMode = false;
 
 function badge(mins) {
   if(!mins || mins <= 0) return '<span style="color:#4a6080">-</span>';
@@ -176,14 +185,9 @@ function fmtDur(m) {
   return h > 0 ? h + 'h ' + mn + 'm' : mn + 'm';
 }
 
-function getToday() {
-  const d = new Date();
-  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
-}
-
 function jetblueUrl(origin, dest) {
-  const parts = getToday().split('-');
-  const dateStr = parts[1] + '/' + parts[2] + '/' + parts[0];
+  const d = new Date();
+  const dateStr = String(d.getMonth()+1).padStart(2,'0') + '/' + String(d.getDate()).padStart(2,'0') + '/' + d.getFullYear();
   return 'https://www.jetblue.com/booking/flights?from=' + origin + '&to=' + dest + '&depart=' + dateStr + '&isMultiCity=false&noOfRoute=1&adults=1&children=0&infants=0&usePoints=true';
 }
 
@@ -208,11 +212,8 @@ function buildTypeTabs() {
 }
 
 function setType(t) {
-  activeType = t;
-  activeAirport = 'ALL';
-  buildTypeTabs();
-  buildAirportTabs();
-  renderTable(currentFiltered());
+  activeType = t; activeAirport = 'ALL';
+  buildTypeTabs(); buildAirportTabs(); renderTable(currentFiltered());
 }
 
 function buildAirportTabs() {
@@ -224,22 +225,21 @@ function buildAirportTabs() {
   base.forEach(f => { counts[f.depAirport] = (counts[f.depAirport] || 0) + 1; });
   const airports = Object.entries(counts).sort((a,b) => b[1]-a[1]);
   let html = '<div class="airport-tab ' + (activeAirport==='ALL'?'active':'') + '" onclick="setAirport(\'ALL\')">ALL<span class="count">' + base.length + '</span></div>';
-  airports.forEach(function(pair) {
-    html += '<div class="airport-tab ' + (activeAirport===pair[0]?'active':'') + '" onclick="setAirport(\'' + pair[0] + '\')">' + pair[0] + '<span class="count">' + pair[1] + '</span></div>';
+  airports.forEach(function(p) {
+    html += '<div class="airport-tab ' + (activeAirport===p[0]?'active':'') + '" onclick="setAirport(\'' + p[0] + '\')">' + p[0] + '<span class="count">' + p[1] + '</span></div>';
   });
   $id('airportTabs').innerHTML = html;
 }
 
 function setAirport(ap) {
   activeAirport = ap;
-  buildAirportTabs();
-  renderTable(currentFiltered());
+  buildAirportTabs(); renderTable(currentFiltered());
 }
 
 function renderTable(flights) {
   const rowClass = f => f.predicted ? 'row-pred' : (f.risk==='high'?'row-high':f.risk==='med'?'row-med':'row-low');
   if (flights.length === 0) {
-    $id('tbody').innerHTML = '<tr><td colspan="18"><div class="empty"><div class="empty-title">No flights match this filter</div></div></td></tr>';
+    $id('tbody').innerHTML = '<tr><td colspan="18"><div class="empty"><div class="empty-title">No flights to show</div><div style="font-size:11px">Tap SCAN NOW to fetch current delays.</div></div></td></tr>';
     return;
   }
   $id('tbody').innerHTML = flights.map(function(f) {
@@ -268,20 +268,15 @@ function renderTable(flights) {
   }).join('');
 }
 
-async function loadFlights() {
-  const btn = $id('refreshBtn');
-  btn.disabled = true; btn.textContent = 'Loading...';
-  hide('errBox');
-
+async function loadData() {
   try {
     const res = await fetch('/api/delays');
-    if (!res.ok) throw new Error('Server error ' + res.status);
     const data = await res.json();
-    if (!data.success) throw new Error(data.error || 'Unknown error');
 
     allFlights = data.data || [];
-    activeAirport = 'ALL';
-    activeType = 'ALL';
+    autoMode = data.autoMode;
+    $id('autoBtn').textContent = 'AUTO: ' + (autoMode ? 'ON' : 'OFF');
+    $id('autoBtn').className = 'btn ' + (autoMode ? 'btn-auto-on' : 'btn-auto-off');
 
     if (allFlights.length > 0) {
       $id('s1').textContent = data.confirmedDelays;
@@ -290,33 +285,79 @@ async function loadFlights() {
       const conf = allFlights.filter(f => !f.predicted);
       $id('s4').textContent = conf.length ? Math.round(conf.reduce((s,f) => s+f.depDelay, 0)/conf.length) + 'm' : '-';
       show('statsRow'); show('colorGuide'); show('filterSection'); show('typeSection');
-      buildTypeTabs();
-      buildAirportTabs();
+      buildTypeTabs(); buildAirportTabs();
+      renderTable(currentFiltered());
     } else {
       hide('statsRow'); hide('colorGuide'); hide('filterSection'); hide('typeSection');
+      renderTable([]);
     }
 
-    renderTable(allFlights);
+    if (data.lastUpdated) {
+      const ageMin = Math.round((Date.now() - new Date(data.lastUpdated)) / 60000);
+      $id('lastUpdated').textContent = ageMin + 'm ago';
+    } else {
+      $id('lastUpdated').textContent = 'no data yet';
+    }
 
-    const updated = data.lastUpdated ? new Date(data.lastUpdated).toLocaleTimeString() : 'never';
-    const ageMin = data.lastUpdated ? Math.round((Date.now() - new Date(data.lastUpdated)) / 60000) : '?';
-    $id('lastUpdated').textContent = 'Data from ' + updated + ' (' + ageMin + 'm ago)';
+    hide('warnBox');
+    if (data.dataStale) {
+      show('warnBox', 'Last scan was over 2 hours ago - data expired. Tap SCAN NOW for current flights.');
+    }
 
-    let msg = data.confirmedDelays + ' confirmed + ' + data.predictedDelays + ' predicted, ' + data.total + ' scanned';
-    if (data.refreshing) msg += ' | SCAN RUNNING NOW';
-    if (data.quietHours) msg += ' | quiet hours (2-8AM ET)';
-    if (data.rateLimitHits) msg += ' | ' + data.rateLimitHits + ' rate-limit waits';
-    if (data.lastError) msg += ' | ERROR: ' + data.lastError;
-    show('progBox', msg);
+    if (data.refreshing) {
+      show('progBox', 'SCANNING: ' + (data.scanProgress || 'working') + (data.rateLimitHits ? ' | ' + data.rateLimitHits + ' rate-limit waits' : ''));
+      $id('scanBtn').disabled = true;
+      $id('scanBtn').textContent = 'SCANNING...';
+      if (!pollTimer) pollTimer = setInterval(loadData, 8000);
+    } else {
+      $id('scanBtn').disabled = false;
+      $id('scanBtn').textContent = 'SCAN NOW';
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      if (data.lastUpdated) {
+        show('progBox', data.confirmedDelays + ' confirmed + ' + data.predictedDelays + ' predicted, ' + data.total + ' scanned' + (data.lastError ? ' | ERROR: ' + data.lastError : ''));
+      } else {
+        hide('progBox');
+      }
+    }
   } catch(e) {
-    hide('progBox');
     show('errBox', 'Error: ' + e.message);
   }
-
-  btn.disabled = false; btn.textContent = 'REFRESH';
 }
 
-loadFlights();
+async function startScan() {
+  $id('scanBtn').disabled = true;
+  $id('scanBtn').textContent = 'STARTING...';
+  hide('errBox');
+  try {
+    await fetch('/api/scan');
+    show('progBox', 'Scan started - flights will appear as they are found...');
+    if (!pollTimer) pollTimer = setInterval(loadData, 8000);
+    setTimeout(loadData, 2000);
+  } catch(e) {
+    show('errBox', 'Error: ' + e.message);
+    $id('scanBtn').disabled = false;
+    $id('scanBtn').textContent = 'SCAN NOW';
+  }
+}
+
+async function toggleAuto() {
+  const next = !autoMode;
+  try {
+    await fetch('/api/auto?on=' + next);
+    autoMode = next;
+    $id('autoBtn').textContent = 'AUTO: ' + (autoMode ? 'ON' : 'OFF');
+    $id('autoBtn').className = 'btn ' + (autoMode ? 'btn-auto-on' : 'btn-auto-off');
+    if (autoMode) {
+      show('progBox', 'AUTO mode ON - scanning every 30 min. Turn OFF when done to stop API charges.');
+      if (!pollTimer) pollTimer = setInterval(loadData, 8000);
+    }
+    loadData();
+  } catch(e) {
+    show('errBox', 'Error: ' + e.message);
+  }
+}
+
+loadData();
 </script>
 </body>
 </html>
