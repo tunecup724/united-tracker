@@ -9,7 +9,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
-const FA_KEY = process.env.FA_KEY || 'oJr6tdNWilpJRBsIrnTzKDQpXJFfqwyl';
+const FA_KEY = process.env.FA_KEY || 'zf08h2yTphhFknZYuu5drbgGae3E85rn';
 const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
 const TURNAROUND_MIN = 35;
@@ -20,7 +20,6 @@ const BACKOFF_BASE_MS = 20000;
 const SCAN_TIMEOUT_MS = 90 * 60 * 1000;
 const MAX_DATA_AGE_MS = 2 * 60 * 60 * 1000;
 
-// FULL DEPTH - fetch everything
 const MAX_PAGE_LOOPS = 40;
 const HORIZON_HOURS = 48;
 
@@ -304,6 +303,21 @@ function setAuto(on) {
   }
 }
 
+app.get('/api/keytest', async (req, res) => {
+  const out = {};
+  try {
+    const r = await axios.get(`${FA_URL}/operators/UAL/flights/scheduled`, {
+      headers: { 'x-apikey': FA_KEY }, params: { max_pages: 1 }, timeout: 20000
+    });
+    out.operatorTest = { status: r.status, count: (r.data?.scheduled || []).length };
+  } catch(e) {
+    out.operatorTest = { error: e.response?.status || e.message };
+  }
+  out.keyPreview = FA_KEY ? `${FA_KEY.slice(0,4)}...${FA_KEY.slice(-4)}` : 'MISSING';
+  out.keyFromEnv = !!process.env.FA_KEY;
+  res.json(out);
+});
+
 app.get('/api/delays', (req, res) => {
   const live = liveData();
   const age = cache.lastUpdated ? Date.now() - new Date(cache.lastUpdated).getTime() : null;
@@ -353,5 +367,5 @@ process.on('unhandledRejection', (err) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT} - AUTO OFF, manual scans only, FULL DEPTH`);
+  console.log(`Server running on port ${PORT} - AUTO OFF, manual scans only`);
 });
