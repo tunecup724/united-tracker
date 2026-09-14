@@ -14,10 +14,13 @@ const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
 const TURNAROUND_MIN = 35;
 const AUTO_INTERVAL_MIN = 30;
-const CALL_GAP_MS = 9000;
+
+// PREMIUM TIER - 100 queries/sec allowed
+const CALL_GAP_MS = 100;        // was 9000
+const INBOUND_BATCH = 25;       // parallel inbound lookups
 const MAX_RETRIES = 4;
-const BACKOFF_BASE_MS = 20000;
-const SCAN_TIMEOUT_MS = 90 * 60 * 1000;
+const BACKOFF_BASE_MS = 3000;
+const SCAN_TIMEOUT_MS = 20 * 60 * 1000;
 const MAX_DATA_AGE_MS = 2 * 60 * 60 * 1000;
 
 const MAX_PAGE_LOOPS = 40;
@@ -58,6 +61,20 @@ async function throttledGet(url, params, attempt = 0) {
   }
 }
 
+// Parallel-safe GET for batched inbound lookups
+async function parallelGet(url, attempt = 0) {
+  try {
+    return await axios.get(url, { headers: { 'x-apikey': FA_KEY }, timeout: 20000 });
+  } catch (e) {
+    if (e.response?.status === 429 && attempt < MAX_RETRIES) {
+      cache.rateLimitHits++;
+      await sleep(BACKOFF_BASE_MS * Math.pow(2, attempt));
+      return parallelGet(url, attempt + 1);
+    }
+    throw e;
+  }
+}
+
 function fmtTime(isoStr, timezone) {
   if (!isoStr) return '-';
   try {
@@ -74,13 +91,6 @@ function getUAIdent(f) {
   const cs = f.codeshares_iata || [];
   const ua = cs.find(c => typeof c === 'string' && c.startsWith('UA'));
   return ua || null;
-}
-
-async function getInboundFlight(faFlightId) {
-  try {
-    const r = await throttledGet(`${FA_URL}/flights/${faFlightId}`, {});
-    return r.data?.flights?.[0] || null;
-  } catch(e) { return null; }
 }
 
 function baseEligible(f, now) {
@@ -132,8 +142,13 @@ function mapFlight(f, extra = {}) {
 
 async function attachInbound(flight) {
   if (!flight._inboundId) return flight;
-  const inb = await getInboundFlight(flight._inboundId);
+  let inb = null;
+  try {
+    const r = await parallelGet(`${FA_URL}/flights/${flight._inboundId}`);
+    inb = r.data?.flights?.[0] || null;
+  } catch(e) { return flight; }
   if (!inb) return flight;
+
   const tz = flight._tz;
   const inbEstArrIso = inb.estimated_in || inb.estimated_on || inb.scheduled_in;
   flight.inboundFlightNum = inb.ident_iata || inb.ident || '-';
@@ -222,6 +237,16 @@ async function fetchOperatorProgressive(operator) {
   commit();
 }
 
+// Process a list of flights in parallel batches
+async function processInboundBatched(list, label) {
+  for (let i = 0; i < list.length; i += INBOUND_BATCH) {
+    const slice = list.slice(i, i + INBOUND_BATCH);
+    await Promise.all(slice.map(f => attachInbound(f)));
+    commit();
+    cache.scanProgress = `${label} ${Math.min(i + INBOUND_BATCH, list.length)}/${list.length}`;
+  }
+}
+
 async function runScan() {
   if (cache.refreshing) {
     const running = cache.refreshStartedAt ? (Date.now() - cache.refreshStartedAt) : 0;
@@ -233,44 +258,38 @@ async function runScan() {
   cache.rateLimitHits = 0;
   cache.scanProgress = 'starting';
   acc = { confirmed: [], predicted: [], candidates: [], seen: new Set(), totalScanned: 0, stats: {} };
+  const t0 = Date.now();
   console.log('Scan started', new Date().toISOString());
 
   try {
-    for (const op of OPERATORS) {
-      await fetchOperatorProgressive(op);
-      console.log(`${op} done. Confirmed so far: ${acc.confirmed.length}`);
-    }
+    // PHASE 1 - fetch all operators in parallel (premium can handle it)
+    cache.scanProgress = 'fetching all operators';
+    await Promise.all(OPERATORS.map(op => fetchOperatorProgressive(op)));
 
-    cache.scanProgress = `inbound lookups for ${acc.confirmed.length} confirmed`;
-    for (let i = 0; i < acc.confirmed.length; i++) {
-      await attachInbound(acc.confirmed[i]);
-      if (i % 3 === 0) {
-        commit();
-        cache.scanProgress = `inbound ${i + 1}/${acc.confirmed.length} (confirmed)`;
-      }
-    }
+    // PHASE 2 - inbound for confirmed delays, batched
+    cache.scanProgress = `inbound for ${acc.confirmed.length} confirmed`;
+    await processInboundBatched(acc.confirmed, 'confirmed inbound');
     commit();
 
+    // PHASE 3 - inbound for candidates, batched, soonest departures first
+    acc.candidates.sort((a, b) => new Date(a.schedDepIso) - new Date(b.schedDepIso));
     cache.scanProgress = `checking ${acc.candidates.length} candidates`;
-    for (let i = 0; i < acc.candidates.length; i++) {
-      const f = acc.candidates[i];
-      await attachInbound(f);
-      if (f.inboundEstArr && !f.inboundLanded && f.willSlip) {
-        const schedDep = new Date(f.schedDepIso).getTime();
-        const estDep = new Date(f.estDepIso).getTime();
-        const readyTime = estDep + f.slipMins * 60000;
-        if ((readyTime - schedDep) / 60000 >= 30) acc.predicted.push(f);
-      }
-      if (i % 3 === 0) {
-        commit();
-        cache.scanProgress = `inbound ${i + 1}/${acc.candidates.length} (predicted) - ${acc.predicted.length} found`;
-      }
-    }
+    await processInboundBatched(acc.candidates, 'candidate inbound');
+
+    // Evaluate predictions
+    acc.predicted = acc.candidates.filter(f => {
+      if (!f.inboundEstArr || f.inboundLanded || !f.willSlip) return false;
+      const schedDep = new Date(f.schedDepIso).getTime();
+      const estDep = new Date(f.estDepIso).getTime();
+      const readyTime = estDep + f.slipMins * 60000;
+      return (readyTime - schedDep) / 60000 >= 30;
+    });
 
     commit();
     cache.lastError = null;
-    cache.scanProgress = 'complete';
-    console.log(`Scan complete: ${acc.confirmed.length} confirmed, ${acc.predicted.length} predicted, ${acc.totalScanned} scanned`);
+    const secs = Math.round((Date.now() - t0) / 1000);
+    cache.scanProgress = `complete in ${secs}s`;
+    console.log(`Scan complete in ${secs}s: ${acc.confirmed.length} confirmed, ${acc.predicted.length} predicted, ${acc.totalScanned} scanned`);
   } catch(e) {
     cache.lastError = e.message + (e.response?.status ? ` (HTTP ${e.response.status})` : '');
     console.error('Scan failed:', e.message);
@@ -367,5 +386,5 @@ process.on('unhandledRejection', (err) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT} - AUTO OFF, manual scans only`);
+  console.log(`Server running on port ${PORT} - PREMIUM mode, AUTO OFF`);
 });
