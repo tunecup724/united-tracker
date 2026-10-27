@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>United Delay Tracker</title>
+<title>Wouldn't You Like To Know</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #07090f; color: #e2e8f0; font-family: system-ui, sans-serif; min-height: 100vh; }
@@ -65,7 +65,7 @@
   <div class="brand">
     <div class="badge">UA</div>
     <div>
-      <div class="title">United Delay Tracker</div>
+      <div class="title">Wouldn't You Like To Know</div>
       <div class="sub">manual scans only - data expires after 2h</div>
     </div>
   </div>
@@ -308,13 +308,13 @@ async function loadData() {
       show('progBox', 'SCANNING: ' + (data.scanProgress || 'working') + (data.rateLimitHits ? ' | ' + data.rateLimitHits + ' rate-limit waits' : ''));
       $id('scanBtn').disabled = true;
       $id('scanBtn').textContent = 'SCANNING...';
-      if (!pollTimer) pollTimer = setInterval(loadData, 8000);
+      if (!pollTimer) pollTimer = setInterval(loadData, 5000);
     } else {
       $id('scanBtn').disabled = false;
       $id('scanBtn').textContent = 'SCAN NOW';
       if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
       if (data.lastUpdated) {
-        show('progBox', data.confirmedDelays + ' confirmed + ' + data.predictedDelays + ' predicted, ' + data.total + ' scanned' + (data.lastError ? ' | ERROR: ' + data.lastError : ''));
+        show('progBox', data.confirmedDelays + ' confirmed + ' + data.predictedDelays + ' predicted, ' + data.total + ' scanned' + (data.scanProgress ? ' | ' + data.scanProgress : '') + (data.lastError ? ' | ERROR: ' + data.lastError : ''));
       } else {
         hide('progBox');
       }
@@ -331,7 +331,7 @@ async function startScan() {
   try {
     await fetch('/api/scan');
     show('progBox', 'Scan started - flights will appear as they are found...');
-    if (!pollTimer) pollTimer = setInterval(loadData, 8000);
+    if (!pollTimer) pollTimer = setInterval(loadData, 5000);
     setTimeout(loadData, 2000);
   } catch(e) {
     show('errBox', 'Error: ' + e.message);
@@ -349,7 +349,7 @@ async function toggleAuto() {
     $id('autoBtn').className = 'btn ' + (autoMode ? 'btn-auto-on' : 'btn-auto-off');
     if (autoMode) {
       show('progBox', 'AUTO mode ON - scanning every 30 min. Turn OFF when done to stop API charges.');
-      if (!pollTimer) pollTimer = setInterval(loadData, 8000);
+      if (!pollTimer) pollTimer = setInterval(loadData, 5000);
     }
     loadData();
   } catch(e) {
