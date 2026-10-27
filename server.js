@@ -9,15 +9,15 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
-const FA_KEY = process.env.FA_KEY || 'zf08h2yTphhFknZYuu5drbgGae3E85rn';
+const FA_KEY = process.env.FA_KEY || 'BePYhefUzH33tNgng8BDHEHNTzuPIHT2';
 const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
 const TURNAROUND_MIN = 35;
 const AUTO_INTERVAL_MIN = 30;
 
-// PREMIUM TIER - 100 queries/sec allowed
-const CALL_GAP_MS = 100;        // was 9000
-const INBOUND_BATCH = 25;       // parallel inbound lookups
+// PREMIUM TIER - 100 queries/sec
+const CALL_GAP_MS = 100;
+const INBOUND_BATCH = 25;
 const MAX_RETRIES = 4;
 const BACKOFF_BASE_MS = 3000;
 const SCAN_TIMEOUT_MS = 20 * 60 * 1000;
@@ -61,7 +61,6 @@ async function throttledGet(url, params, attempt = 0) {
   }
 }
 
-// Parallel-safe GET for batched inbound lookups
 async function parallelGet(url, attempt = 0) {
   try {
     return await axios.get(url, { headers: { 'x-apikey': FA_KEY }, timeout: 20000 });
@@ -237,7 +236,6 @@ async function fetchOperatorProgressive(operator) {
   commit();
 }
 
-// Process a list of flights in parallel batches
 async function processInboundBatched(list, label) {
   for (let i = 0; i < list.length; i += INBOUND_BATCH) {
     const slice = list.slice(i, i + INBOUND_BATCH);
@@ -262,21 +260,17 @@ async function runScan() {
   console.log('Scan started', new Date().toISOString());
 
   try {
-    // PHASE 1 - fetch all operators in parallel (premium can handle it)
     cache.scanProgress = 'fetching all operators';
     await Promise.all(OPERATORS.map(op => fetchOperatorProgressive(op)));
 
-    // PHASE 2 - inbound for confirmed delays, batched
     cache.scanProgress = `inbound for ${acc.confirmed.length} confirmed`;
     await processInboundBatched(acc.confirmed, 'confirmed inbound');
     commit();
 
-    // PHASE 3 - inbound for candidates, batched, soonest departures first
     acc.candidates.sort((a, b) => new Date(a.schedDepIso) - new Date(b.schedDepIso));
     cache.scanProgress = `checking ${acc.candidates.length} candidates`;
     await processInboundBatched(acc.candidates, 'candidate inbound');
 
-    // Evaluate predictions
     acc.predicted = acc.candidates.filter(f => {
       if (!f.inboundEstArr || f.inboundLanded || !f.willSlip) return false;
       const schedDep = new Date(f.schedDepIso).getTime();
