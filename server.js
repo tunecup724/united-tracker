@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const path = require('path');
+const flightview = require('./flightview');
 
 const app = express();
 app.use(cors());
@@ -33,7 +34,7 @@ let autoTimer = null;
 let cache = {
   data: [], total: 0, confirmedDelays: 0, predictedDelays: 0,
   lastUpdated: null, refreshing: false, refreshStartedAt: null,
-  lastError: null, operatorStats: {}, rateLimitHits: 0, scanProgress: ''
+  lastError: null, operatorStats: {}, rateLimitHits: 0, scanProgress: '', source: null
 };
 
 let acc = { confirmed: [], predicted: [], candidates: [], seen: new Set(), totalScanned: 0, stats: {} };
@@ -254,6 +255,7 @@ async function runScan() {
   cache.refreshStartedAt = Date.now();
   cache.rateLimitHits = 0;
   cache.scanProgress = 'starting';
+  cache.source = 'flightaware';
   acc = { confirmed: [], predicted: [], candidates: [], seen: new Set(), totalScanned: 0, stats: {} };
   const t0 = Date.now();
   console.log('Scan started', new Date().toISOString());
@@ -291,6 +293,146 @@ async function runScan() {
     cache.refreshStartedAt = null;
   }
 }
+
+// ===================== FlightView on-demand search =====================
+// Runs ONLY when the Search Flights button is pressed. No schedule, no auto-refresh.
+// Shares the same lock (cache.refreshing) as SCAN NOW, so the two can never overlap.
+
+function localDateIn(iso, tz) {
+  try {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: tz || 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(iso));
+  } catch { return null; }
+}
+
+// When the search box is empty, search the flights currently on the dashboard.
+function fvTargetsFromDashboard() {
+  return liveData()
+    .map(f => {
+      const m = String(f.flightNum || '').match(/^([A-Z0-9]{2})(\d{1,4})$/);
+      if (!m) return null;
+      return {
+        airline: m[1], number: String(parseInt(m[2], 10)),
+        depapt: f.depAirport && f.depAirport !== '-' ? f.depAirport : null,
+        date: f.schedDepIso ? localDateIn(f.schedDepIso, f._tz) : null
+      };
+    })
+    .filter(Boolean);
+}
+
+// Same inbound math as attachInbound(), but fed from FlightView's previous-flight data.
+function fillInbound(flight, inb, inbEstArrIso) {
+  const tz = flight._tz;
+  flight.inboundFlightNum = inb.ident_iata || inb.ident || '-';
+  flight.inboundOrigin = inb.origin?.code_iata || '-';
+  flight.inboundSchedArr = fmtTime(inb.scheduled_in, tz);
+  flight.inboundEstArr = fmtTime(inbEstArrIso, tz);
+  flight.inboundActualArr = fmtTime(inb.actual_in || inb.actual_on, tz);
+  flight.inboundLanded = !!(inb.actual_in || inb.actual_on);
+  if (inbEstArrIso && flight.estDepIso && !flight.inboundLanded) {
+    const readyTime = new Date(inbEstArrIso).getTime() + TURNAROUND_MIN * 60000;
+    const estDepTime = new Date(flight.estDepIso).getTime();
+    const slipMins = Math.round((readyTime - estDepTime) / 60000);
+    if (slipMins > 0) { flight.willSlip = true; flight.slipMins = slipMins; }
+    else { flight.willSlip = false; }
+  }
+  return flight;
+}
+
+// Same PREDICTED rule as runScan(): inbound-driven ready time 30+ min past scheduled departure.
+function isPredicted(f) {
+  if (!f.inboundEstArr || f.inboundLanded || !f.willSlip) return false;
+  const schedDep = new Date(f.schedDepIso).getTime();
+  const estDep = new Date(f.estDepIso).getTime();
+  const readyTime = estDep + f.slipMins * 60000;
+  return (readyTime - schedDep) / 60000 >= 30;
+}
+
+async function runFlightViewSearch(targets) {
+  cache.refreshing = true;                 // set before any await: blocks overlapping runs
+  cache.refreshStartedAt = Date.now();
+  cache.rateLimitHits = 0;
+  cache.scanProgress = 'FlightView search starting';
+  cache.source = 'flightview';
+  const t0 = Date.now();
+  try {
+    const result = await flightview.search(targets, { onProgress: m => { cache.scanProgress = m; } });
+    const chains = flightview.computeChains(result.records, TURNAROUND_MIN);
+
+    acc = { confirmed: [], predicted: [], candidates: [], seen: new Set(), totalScanned: 0, stats: {} };
+    const now = new Date();
+    for (const [key, f] of result.records) {
+      const uaIdent = getUAIdent(f);
+      if (!uaIdent) continue;
+      f._uaIdent = uaIdent;
+      acc.totalScanned++;
+      if (!baseEligible(f, now)) continue;
+      const isConfirmed = (f.departure_delay || 0) >= 1800;
+      const flight = mapFlight(f, { predicted: !isConfirmed });
+      const prev = f._fv.prevKey ? result.records.get(f._fv.prevKey) : null;
+      if (prev) {
+        const pc = chains.get(f._fv.prevKey);
+        const inbEstIso = pc && pc.effArrMs
+          ? new Date(pc.effArrMs).toISOString()
+          : (prev.estimated_in || prev.scheduled_in);
+        fillInbound(flight, prev, inbEstIso);
+      }
+      if (isConfirmed) acc.confirmed.push(flight);
+      else if (prev && isPredicted(flight)) acc.predicted.push(flight);
+    }
+    acc.stats = { FlightView: { fetched: result.pages, error: result.stoppedReason || null } };
+    cache.source = 'flightview';
+    commit();
+    cache.lastError = result.stoppedReason || null;
+    const secs = Math.round((Date.now() - t0) / 1000);
+    cache.scanProgress = `FlightView search ${result.stoppedReason ? 'STOPPED' : 'complete'} in ${secs}s - ` +
+      `${result.pages} pages, ${result.records.size} flights` +
+      (result.notes.length ? ` | notes: ${result.notes.slice(0, 5).join('; ')}` : '');
+    console.log(cache.scanProgress);
+  } catch (e) {
+    cache.lastError = e.message;
+    cache.scanProgress = 'FlightView search failed';
+    console.error('FlightView search failed:', e.message);
+  } finally {
+    cache.refreshing = false;
+    cache.refreshStartedAt = null;
+  }
+}
+
+app.post('/api/flightview/search', (req, res) => {
+  if (flightview.mode() === 'disabled') {
+    return res.json({ success: false, disabled: true,
+      message: 'FlightView live retrieval is OFF - no pages were requested. It will be switched on only after OAG gives written permission.' });
+  }
+  if (cache.refreshing) {
+    return res.status(409).json({ success: false, busy: true, message: 'A scan or search is already running - wait for it to finish.' });
+  }
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(req.body?.date || '') ? req.body.date : null;
+  const raw = Array.isArray(req.body?.flights) ? req.body.flights : String(req.body?.flights || '').split(/[,\n]+/);
+  const entries = raw.map(s => String(s).trim()).filter(Boolean);
+  let targets = entries.map(s => flightview.parseTarget(s, date)).filter(Boolean);
+  const ignored = entries.filter(s => !flightview.parseTarget(s, date));
+  let from = 'your list';
+  if (!entries.length) { targets = fvTargetsFromDashboard(); from = 'the dashboard'; }
+  if (!targets.length) {
+    return res.json({ success: false, message: 'Enter flight numbers (e.g. UA1234, UA567/EWR) or run a scan first.', ignored });
+  }
+  runFlightViewSearch(targets);
+  res.json({ success: true, message: `Searching ${Math.min(targets.length, flightview.CONFIG.maxFlights)} flights from ${from} on FlightView`, ignored });
+});
+
+app.get('/api/flightview/status', (req, res) => {
+  const c = flightview.CONFIG;
+  // Checks the browser is installed without launching it or contacting any site.
+  let browser = { playwright: false, chromium: false };
+  try {
+    const pw = require('playwright');
+    browser.playwright = true;
+    const exe = process.env.FV_CHROMIUM_PATH || pw.chromium.executablePath();
+    browser.chromium = !!exe && require('fs').existsSync(exe);
+  } catch (e) { browser.error = e.message.split('\n')[0]; }
+  res.json({ mode: flightview.mode(), browser, maxFlights: c.maxFlights, maxPages: c.maxPages, prevDepth: c.prevDepth, pageGapMs: c.pageGapMs, busy: cache.refreshing });
+});
+// =================== end FlightView on-demand search ===================
 
 function liveData() {
   if (!cache.lastUpdated) return [];
@@ -347,6 +489,8 @@ app.get('/api/delays', (req, res) => {
     scanProgress: cache.scanProgress,
     lastError: cache.lastError,
     operatorStats: cache.operatorStats,
+    source: cache.source,
+    flightviewMode: flightview.mode(),
     timestamp: new Date().toISOString()
   });
 });
