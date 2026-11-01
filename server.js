@@ -9,13 +9,12 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
-const FA_KEY = process.env.FA_KEY || 'BePYhefUzH33tNgng8BDHEHNTzuPIHT2';
+const FA_KEY = process.env.FA_KEY || '5PTexDEFwT5mzFAXHHV5KqZ316bLit8F';
 const FA_URL = 'https://aeroapi.flightaware.com/aeroapi';
 
 const TURNAROUND_MIN = 35;
 const AUTO_INTERVAL_MIN = 30;
 
-// PREMIUM TIER - 100 queries/sec
 const CALL_GAP_MS = 100;
 const INBOUND_BATCH = 25;
 const MAX_RETRIES = 4;
