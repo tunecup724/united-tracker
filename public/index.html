@@ -18,6 +18,8 @@
   .btn-auto-off { background: #1a2a45; border: 1px solid #2a3a55; }
   .btn-auto-on { background: #16a34a; }
   .age { font-family: monospace; font-size: 11px; color: #4a6080; }
+  .fv-input { background: #0d1829; border: 1px solid #2a3a55; color: #e2e8f0; font-family: monospace; font-size: 12px; padding: 8px 10px; border-radius: 5px; width: 190px; }
+  .fv-input::placeholder { color: #4a6080; }
   .main { padding: 18px; }
   .prog { background: rgba(0,102,204,0.08); border: 1px solid rgba(0,102,204,0.2); border-radius: 6px; padding: 10px 14px; color: #4a90d0; font-family: monospace; font-size: 11px; margin-bottom: 14px; }
   .warn { background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.25); border-radius: 6px; padding: 10px 14px; color: #f59e0b; font-family: monospace; font-size: 11px; margin-bottom: 14px; }
@@ -73,6 +75,8 @@
     <span class="age" id="lastUpdated"></span>
     <button class="btn" id="scanBtn" onclick="startScan()">SCAN NOW</button>
     <button class="btn btn-auto-off" id="autoBtn" onclick="toggleAuto()">AUTO: OFF</button>
+    <input class="fv-input" id="fvFlights" placeholder="UA1234, UA567/EWR" autocomplete="off" autocapitalize="characters">
+    <button class="btn" id="fvBtn" onclick="startFlightViewSearch()">SEARCH FLIGHTS</button>
   </div>
 </div>
 <div class="main">
@@ -308,10 +312,14 @@ async function loadData() {
       show('progBox', 'SCANNING: ' + (data.scanProgress || 'working') + (data.rateLimitHits ? ' | ' + data.rateLimitHits + ' rate-limit waits' : ''));
       $id('scanBtn').disabled = true;
       $id('scanBtn').textContent = 'SCANNING...';
+      $id('fvBtn').disabled = true;
+      $id('fvBtn').textContent = data.source === 'flightview' ? 'SEARCHING...' : 'SEARCH FLIGHTS';
       if (!pollTimer) pollTimer = setInterval(loadData, 5000);
     } else {
       $id('scanBtn').disabled = false;
       $id('scanBtn').textContent = 'SCAN NOW';
+      $id('fvBtn').disabled = false;
+      $id('fvBtn').textContent = 'SEARCH FLIGHTS';
       if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
       if (data.lastUpdated) {
         show('progBox', data.confirmedDelays + ' confirmed + ' + data.predictedDelays + ' predicted, ' + data.total + ' scanned' + (data.scanProgress ? ' | ' + data.scanProgress : '') + (data.lastError ? ' | ERROR: ' + data.lastError : ''));
@@ -339,6 +347,42 @@ async function startScan() {
     $id('scanBtn').textContent = 'SCAN NOW';
   }
 }
+
+// FlightView search: runs once per button press, never on a timer.
+function todayLocal() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+
+async function startFlightViewSearch() {
+  const flights = $id('fvFlights').value.trim();
+  try { localStorage.setItem('fvFlights', flights); } catch(e) {}
+  $id('fvBtn').disabled = true;
+  $id('fvBtn').textContent = 'STARTING...';
+  hide('errBox');
+  try {
+    const res = await fetch('/api/flightview/search', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ flights: flights, date: todayLocal() })
+    });
+    const data = await res.json();
+    if (!data.success) {
+      show('warnBox', data.message || 'Search could not start.');
+      $id('fvBtn').disabled = false;
+      $id('fvBtn').textContent = 'SEARCH FLIGHTS';
+      return;
+    }
+    show('progBox', data.message + (data.ignored && data.ignored.length ? ' | ignored: ' + data.ignored.join(', ') : ''));
+    if (!pollTimer) pollTimer = setInterval(loadData, 5000);
+    setTimeout(loadData, 2000);
+  } catch(e) {
+    show('errBox', 'Error: ' + e.message);
+    $id('fvBtn').disabled = false;
+    $id('fvBtn').textContent = 'SEARCH FLIGHTS';
+  }
+}
+
+try { $id('fvFlights').value = localStorage.getItem('fvFlights') || ''; } catch(e) {}
 
 async function toggleAuto() {
   const next = !autoMode;
