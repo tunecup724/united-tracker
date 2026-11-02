@@ -272,7 +272,55 @@ function parseJetBlue(page, ownNumber) {
   };
 }
 
+// ---------- AirNav Radar (tail by flight; a plane's "Future" flights) ----------
+const airnavFlightUrl = num => `${base('airnav')}/data/flights/UA${num}`;
+const airnavAircraftUrl = tail => `${base('airnav')}/data/registration/${String(tail).toUpperCase()}`;
+
+// Rows look like (one value per line):
+//   Nov 4 | UA1572 | UAL1572 | Denver | KDEN | DEN | 09:40 MST | [ATD] | Phoenix | KPHX | PHX | 11:44 MST | [type] | [N12345] | Estimated | 02h04m
+// -> [{ ymd, number, from, to, depIso, arrIso, tail, status }]
+function parseAirnavRows(page, nowMs = Date.now()) {
+  const L = String(page.text || '').split('\n').map(x => x.trim()).filter(Boolean);
+  const out = [];
+  const t12 = s => { const m = s.match(/^(\d{1,2}):(\d{2})/); if (!m) return null; let h = +m[1]; const ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12; return `${h}:${m[2]} ${ap}`; };
+  for (let i = 0; i < L.length - 10; i++) {
+    const dm = L[i].match(/^([A-Z][a-z]{2})\s+(\d{1,2})$/);
+    const fm = (L[i + 1] || '').match(/^UA(\d{1,4})$/);
+    if (!dm || !fm || MON_IDX[dm[1].toUpperCase()] === undefined) continue;
+    const seg = L.slice(i + 2, i + 20);
+    const end = seg.findIndex((x, k) => k > 4 && /^[A-Z][a-z]{2}\s+\d{1,2}$/.test(x) && /^UA\d+$/.test(seg[k + 1] || ''));
+    const row = end > 0 ? seg.slice(0, end) : seg;
+    const icao = row.map((x, k) => /^[A-Z0-9]{4}$/.test(x) && /^[A-Z0-9]{3}$/.test(row[k + 1] || '') ? k : -1).filter(k => k >= 0);
+    if (icao.length < 2) continue;
+    const from = row[icao[0] + 1], to = row[icao[1] + 1];
+    const std = row.slice(icao[0] + 2, icao[1]).find(x => /^\d{1,2}:\d{2}\s+[A-Z]{3,4}$/.test(x));
+    const sta = row.slice(icao[1] + 2).find(x => /^\d{1,2}:\d{2}\s+[A-Z]{3,4}$/.test(x));
+    const tailTok = row.slice(icao[1] + 2).find(x => /^N[0-9][0-9A-Z]{0,4}$/.test(x));
+    const status = row.slice(icao[1] + 2).find(x => /^(Estimated|Scheduled|Landed|En Route|Delayed|Cancel|Diverted|Departed)/i.test(x)) || '';
+    // year: the one that puts the date closest to now
+    const mo = MON_IDX[dm[1].toUpperCase()], d = +dm[2], y0 = new Date(nowMs).getUTCFullYear();
+    const y = [y0 - 1, y0, y0 + 1].sort((a, b) => Math.abs(Date.UTC(a, mo, d) - nowMs) - Math.abs(Date.UTC(b, mo, d) - nowMs))[0];
+    const ymd = `${y}-${String(mo + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    const depIso = std && AIRPORT_TZ[from] ? fr24Time(t12(std), ymd, from) : null;
+    const arrIso = depIso && sta && AIRPORT_TZ[to] ? localOnOrAfter(t12(sta), localDate(depIso, to), to, Date.parse(depIso)) : null;
+    out.push({ ymd, number: String(parseInt(fm[1], 10)), from, to, depIso, arrIso, tail: tailTok || null, status });
+  }
+  return out;
+}
+// Flight page -> tail of UA<num> leaving depapt on ymd (null if not assigned / not shown)
+function parseAirnavFlight(page, depapt, ymd) {
+  const r = parseAirnavRows(page).find(x => x.from === depapt && x.ymd === ymd);
+  return r && r.tail ? r.tail : null;
+}
+// Aircraft page -> the plane's flights, oldest first
+function parseAirnavAircraft(page) {
+  const seen = new Set();
+  return parseAirnavRows(page).filter(l => l.depIso && !seen.has(l.number + l.depIso) && seen.add(l.number + l.depIso))
+    .sort((a, b) => Date.parse(a.depIso) - Date.parse(b.depIso));
+}
+
 module.exports = {
+  airnavFlightUrl, airnavAircraftUrl, parseAirnavRows, parseAirnavFlight, parseAirnavAircraft,
   jetblueUrl, parseJetBlue,
   fr24FlightUrl, fr24AircraftUrl, parseFr24Flight, parseFr24Aircraft,
   boardUrl, parseBoard, routeUrl, parseRoute, unitedUrl, parseUnited, tailForFleet,
