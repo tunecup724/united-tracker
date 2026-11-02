@@ -3,6 +3,8 @@ const cors = require('cors');
 const axios = require('axios');
 const path = require('path');
 const flightview = require('./flightview');
+const discovery = require('./discovery');
+const fetchers = require('./fetchers');
 
 const app = express();
 app.use(cors());
@@ -92,7 +94,7 @@ function getUAIdent(f) {
   return ua || null;
 }
 
-function baseEligible(f, now) {
+function baseEligible(f, now, maxDurMins = 130) {
   if (!f._uaIdent) return false;
   const s = (f.status || '').toLowerCase();
   if (f.actual_off) return false;
@@ -101,7 +103,7 @@ function baseEligible(f, now) {
   if ((new Date(f.scheduled_out) - now) / 60000 < 30) return false;
   if (!f.scheduled_in) return false;
   const durMins = (new Date(f.scheduled_in) - new Date(f.scheduled_out)) / 60000;
-  if (durMins > 130 || durMins <= 0) return false;
+  if (durMins > maxDurMins || durMins <= 0) return false;
   return true;
 }
 
@@ -246,6 +248,7 @@ async function processInboundBatched(list, label) {
 }
 
 async function runScan() {
+  if (cache.refreshing && cache.source === 'flightview') return;   // never interrupt a FlightView search
   if (cache.refreshing) {
     const running = cache.refreshStartedAt ? (Date.now() - cache.refreshStartedAt) : 0;
     if (running < SCAN_TIMEOUT_MS) return;
@@ -347,46 +350,88 @@ function isPredicted(f) {
   return (readyTime - schedDep) / 60000 >= 30;
 }
 
-async function runFlightViewSearch(targets) {
+// Search Flights keeps flights up to 135 min long (SCAN NOW keeps its original 130).
+const FV_MAX_DURATION_MIN = parseInt(process.env.FV_MAX_DURATION_MIN, 10) || 135;
+
+// Turns FlightView records into dashboard rows with the same rules as before.
+// Records are keyed by flight + scheduled departure, so a flight can only appear once.
+function assembleFlightView(records, chains) {
+  acc = { confirmed: [], predicted: [], candidates: [], seen: new Set(), totalScanned: 0, stats: acc.stats || {} };
+  const now = new Date();
+  for (const [key, f] of records) {
+    const uaIdent = getUAIdent(f);
+    if (!uaIdent) continue;
+    f._uaIdent = uaIdent;
+    acc.totalScanned++;
+    if (!baseEligible(f, now, FV_MAX_DURATION_MIN)) continue;
+    const isConfirmed = (f.departure_delay || 0) >= 1800;
+    const flight = mapFlight(f, { predicted: !isConfirmed });
+    if (f._fv.tail) flight.tail = f._fv.tail;
+    if (f._fv.fleet) flight.fleet = f._fv.fleet;
+    const prev = f._fv.prevKey ? records.get(f._fv.prevKey) : null;
+    if (prev) {
+      const pc = chains.get(f._fv.prevKey);
+      const inbEstIso = pc && pc.effArrMs
+        ? new Date(pc.effArrMs).toISOString()
+        : (prev.estimated_in || prev.scheduled_in);
+      fillInbound(flight, prev, inbEstIso);
+    }
+    if (isConfirmed) acc.confirmed.push(flight);
+    else if (prev && isPredicted(flight)) acc.predicted.push(flight);
+  }
+  commit();
+}
+
+const fmtSecs = s => `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
+
+// job: { targets } = check the listed flights; { discover: true } = find delays automatically
+async function runFlightViewSearch(job) {
   cache.refreshing = true;                 // set before any await: blocks overlapping runs
   cache.refreshStartedAt = Date.now();
   cache.rateLimitHits = 0;
-  cache.scanProgress = 'FlightView search starting';
+  cache.scanProgress = job.discover ? 'Discovery search starting' : 'FlightView search starting';
   cache.source = 'flightview';
+  cache.lastError = null;
+  cache.coverage = null;
   const t0 = Date.now();
+  let progress = '';
+  const soFar = () => ` | ${acc.confirmed.length} confirmed, ${acc.predicted.length} predicted so far`;
   try {
-    const result = await flightview.search(targets, { onProgress: m => { cache.scanProgress = m; } });
-    const chains = flightview.computeChains(result.records, TURNAROUND_MIN);
-
     acc = { confirmed: [], predicted: [], candidates: [], seen: new Set(), totalScanned: 0, stats: {} };
-    const now = new Date();
-    for (const [key, f] of result.records) {
-      const uaIdent = getUAIdent(f);
-      if (!uaIdent) continue;
-      f._uaIdent = uaIdent;
-      acc.totalScanned++;
-      if (!baseEligible(f, now)) continue;
-      const isConfirmed = (f.departure_delay || 0) >= 1800;
-      const flight = mapFlight(f, { predicted: !isConfirmed });
-      const prev = f._fv.prevKey ? result.records.get(f._fv.prevKey) : null;
-      if (prev) {
-        const pc = chains.get(f._fv.prevKey);
-        const inbEstIso = pc && pc.effArrMs
-          ? new Date(pc.effArrMs).toISOString()
-          : (prev.estimated_in || prev.scheduled_in);
-        fillInbound(flight, prev, inbEstIso);
-      }
-      if (isConfirmed) acc.confirmed.push(flight);
-      else if (prev && isPredicted(flight)) acc.predicted.push(flight);
-    }
-    acc.stats = { FlightView: { fetched: result.pages, error: result.stoppedReason || null } };
+    if (job.discover) commit();            // clear the previous results when a new search starts
+    const onProgress = m => { progress = m; cache.scanProgress = m + (job.discover ? soFar() : ''); };
+    const onUpdate = snap => { assembleFlightView(snap.records, snap.chains); cache.scanProgress = progress + soFar(); };
+    const result = job.discover
+      ? await discovery.discover({ onProgress, onUpdate })
+      : await flightview.search(job.targets, { onProgress });
+    const chains = result.chains || flightview.computeChains(result.records, TURNAROUND_MIN);
+    acc.stats = result.counts
+      ? { FlightView: { fetched: result.counts.flightview, error: result.stoppedReason || null },
+          United: { fetched: result.counts.united, error: null },
+          FlightAwareWeb: { fetched: result.counts.flightaware, error: null } }
+      : { FlightView: { fetched: result.pages, error: result.stoppedReason || null } };
     cache.source = 'flightview';
-    commit();
+    cache.discoveryStats = result.stats || null;
+    cache.coverage = result.coverage || null;
+    assembleFlightView(result.records, chains);
     cache.lastError = result.stoppedReason || null;
     const secs = Math.round((Date.now() - t0) / 1000);
-    cache.scanProgress = `FlightView search ${result.stoppedReason ? 'STOPPED' : 'complete'} in ${secs}s - ` +
-      `${result.pages} pages, ${result.records.size} flights` +
-      (result.notes.length ? ` | notes: ${result.notes.slice(0, 5).join('; ')}` : '');
+    const cov = result.coverage;
+    const notes = result.notes.length ? ` | notes: ${result.notes.slice(0, 5).join('; ')}` : '';
+    if (cov) {
+      const st = result.stats;
+      const label = cov.partial
+        ? `PARTIAL - ${cov.reason || 'not finished'}: ${cov.airportsChecked} of ${cov.airportsQueued}+ airports checked, ${cov.tasksNotDone} checks not done`
+        : cov.airportsFailed
+          ? `FINISHED WITH GAPS - ${cov.airportsChecked} of ${cov.airportsQueued} airports checked, ${cov.airportsFailed} board(s) unreadable`
+          : `DISCOVERED AIRPORTS CHECKED - all ${cov.airportsChecked} airports found on the hub boards were checked (not a verified full-network list)`;
+      cache.scanProgress = `Discovery ${label} in ${fmtSecs(secs)} - ${st.flightsChecked} flights checked, ` +
+        `${st.aircraftFollowed} late aircraft followed, ${st.legsLinked + st.fallbackLinks} later flights linked, ` +
+        `${cov.pages} pages | ${acc.confirmed.length} confirmed, ${acc.predicted.length} predicted` + notes;
+    } else {
+      cache.scanProgress = `FlightView search ${result.stoppedReason ? 'STOPPED' : 'complete'} in ${secs}s - ` +
+        `${result.pages} pages, ${result.records.size} flights` + notes;
+    }
     console.log(cache.scanProgress);
   } catch (e) {
     cache.lastError = e.message;
@@ -401,7 +446,7 @@ async function runFlightViewSearch(targets) {
 app.post('/api/flightview/search', (req, res) => {
   if (flightview.mode() === 'disabled') {
     return res.json({ success: false, disabled: true,
-      message: 'FlightView live retrieval is OFF - no pages were requested. It will be switched on only after OAG gives written permission.' });
+      message: 'FlightView live retrieval is OFF (Railway variable FLIGHTVIEW_LIVE is not "true") - no pages were requested.' });
   }
   if (cache.refreshing) {
     return res.status(409).json({ success: false, busy: true, message: 'A scan or search is already running - wait for it to finish.' });
@@ -411,13 +456,15 @@ app.post('/api/flightview/search', (req, res) => {
   const entries = raw.map(s => String(s).trim()).filter(Boolean);
   let targets = entries.map(s => flightview.parseTarget(s, date)).filter(Boolean);
   const ignored = entries.filter(s => !flightview.parseTarget(s, date));
-  let from = 'your list';
-  if (!entries.length) { targets = fvTargetsFromDashboard(); from = 'the dashboard'; }
-  if (!targets.length) {
-    return res.json({ success: false, message: 'Enter flight numbers (e.g. UA1234, UA567/EWR) or run a scan first.', ignored });
+  if (!entries.length) {                       // empty box: find delays automatically
+    runFlightViewSearch({ discover: true });
+    return res.json({ success: true, message: 'Searching hub boards and every airport they list for delayed and likely-delayed United flights', ignored });
   }
-  runFlightViewSearch(targets);
-  res.json({ success: true, message: `Searching ${Math.min(targets.length, flightview.CONFIG.maxFlights)} flights from ${from} on FlightView`, ignored });
+  if (!targets.length) {
+    return res.json({ success: false, message: 'No valid flight numbers (e.g. UA1234, UA567/EWR). Leave the box empty to search automatically.', ignored });
+  }
+  runFlightViewSearch({ targets });
+  res.json({ success: true, message: `Searching ${Math.min(targets.length, flightview.CONFIG.maxFlights)} flights from your list on FlightView`, ignored });
 });
 
 app.get('/api/flightview/status', (req, res) => {
@@ -430,7 +477,9 @@ app.get('/api/flightview/status', (req, res) => {
     const exe = process.env.FV_CHROMIUM_PATH || pw.chromium.executablePath();
     browser.chromium = !!exe && require('fs').existsSync(exe);
   } catch (e) { browser.error = e.message.split('\n')[0]; }
-  res.json({ mode: flightview.mode(), browser, maxFlights: c.maxFlights, maxPages: c.maxPages, prevDepth: c.prevDepth, pageGapMs: c.pageGapMs, busy: cache.refreshing });
+  const sources = { flightview: fetchers.sourceMode('flightview'), united: fetchers.sourceMode('united'), flightawareWeb: fetchers.sourceMode('flightaware') };
+  res.json({ mode: flightview.mode(), sources, browser, maxFlights: c.maxFlights, maxPages: c.maxPages, prevDepth: c.prevDepth, pageGapMs: c.pageGapMs,
+    discovery: discovery.config(), speed: fetchers.speedConfig(), maxDurationMin: FV_MAX_DURATION_MIN, lastDiscovery: cache.discoveryStats || null, coverage: cache.coverage || null, busy: cache.refreshing });
 });
 // =================== end FlightView on-demand search ===================
 
@@ -490,6 +539,7 @@ app.get('/api/delays', (req, res) => {
     lastError: cache.lastError,
     operatorStats: cache.operatorStats,
     source: cache.source,
+    coverage: cache.coverage || null,
     flightviewMode: flightview.mode(),
     timestamp: new Date().toISOString()
   });
