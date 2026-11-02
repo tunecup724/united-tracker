@@ -1,7 +1,7 @@
 // fetchers.js - loads pages for the discovery search (FlightView, United, FlightAware website).
 //
 // Each site has its own switch; all are OFF unless set to "true" in Railway:
-//   FLIGHTVIEW_LIVE, UNITED_LIVE, FLIGHTAWARE_WEB_LIVE, FR24_LIVE, JETBLUE_LIVE
+//   FLIGHTVIEW_LIVE, UNITED_LIVE, FLIGHTAWARE_WEB_LIVE, FR24_LIVE, JETBLUE_LIVE, AIRNAV_LIVE
 // FV_FIXTURE_DIR (testing): read saved pages from a folder instead of any website.
 //
 // Speed settings (per site): FV_CONCURRENCY pages at once (default 2) and at least
@@ -25,11 +25,12 @@ const SOURCES = {
   united:      { flag: 'UNITED_LIVE',          short: 'ua' },
   flightaware: { flag: 'FLIGHTAWARE_WEB_LIVE', short: 'fa' },
   fr24:        { flag: 'FR24_LIVE',            short: 'fr' },
-  jetblue:     { flag: 'JETBLUE_LIVE',         short: 'jb' }
+  jetblue:     { flag: 'JETBLUE_LIVE',         short: 'jb' },
+  airnav:      { flag: 'AIRNAV_LIVE',          short: 'an' }
 };
-const REAL_BASE = { flightview: 'https://www.flightview.com', united: 'https://www.united.com', flightaware: 'https://www.flightaware.com', fr24: 'https://www.flightradar24.com', jetblue: 'https://www.jetblue.com' };
+const REAL_BASE = { flightview: 'https://www.flightview.com', united: 'https://www.united.com', flightaware: 'https://www.flightaware.com', fr24: 'https://www.flightradar24.com', jetblue: 'https://www.jetblue.com', airnav: 'https://www.airnavradar.com' };
 // Test-only base URL overrides (point a source at a local test server).
-const TEST_ENV = { flightview: 'FV_TEST_BASE_URL', united: 'UA_TEST_BASE_URL', flightaware: 'FA_TEST_BASE_URL', fr24: 'FR24_TEST_BASE_URL', jetblue: 'JB_TEST_BASE_URL' };
+const TEST_ENV = { flightview: 'FV_TEST_BASE_URL', united: 'UA_TEST_BASE_URL', flightaware: 'FA_TEST_BASE_URL', fr24: 'FR24_TEST_BASE_URL', jetblue: 'JB_TEST_BASE_URL', airnav: 'AN_TEST_BASE_URL' };
 const base = src => (process.env[TEST_ENV[src]] || REAL_BASE[src]).replace(/\/$/, '');
 
 function sourceMode(src) {
@@ -64,7 +65,7 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
   const fixDir = process.env.FV_FIXTURE_DIR || '';
   const fixDelay = envInt('FV_FIXTURE_DELAY_MS', 0);
   const cache = new Map();                 // url -> Promise(page)
-  const counts = { flightview: 0, united: 0, flightaware: 0, fr24: 0, jetblue: 0 };
+  const counts = { flightview: 0, united: 0, flightaware: 0, fr24: 0, jetblue: 0, airnav: 0 };
   const active = {}, waiters = {}, nextStart = {};
   let total = 0, blocked = null, loaded = 0;
   const loadedUrls = new Set();
@@ -116,10 +117,16 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
       }
       const status = resp ? resp.status() : 0;
       if (status < 400) {
-        await page.waitForFunction(() => {
+        // JetBlue's results load slowly; give them longer and wait specifically for them
+        const kind = /jetblue\.com/.test(url) || (process.env.JB_TEST_BASE_URL && url.startsWith(process.env.JB_TEST_BASE_URL)) ? 'jb'
+          : /airnavradar\.com/.test(url) || (process.env.AN_TEST_BASE_URL && url.startsWith(process.env.AN_TEST_BASE_URL)) ? 'an' : '';
+        await page.waitForFunction(k => {
           const t = document.body ? document.body.innerText : '';
-          return document.querySelector('table tr td') || /FLIGHT STATUS|Aircraft details|Options from|no flights|captcha|verify you are human|access denied/i.test(t);
-        }, null, { timeout: 15000 }).catch(() => {});
+          if (/captcha|verify you are human|access denied/i.test(t)) return true;
+          if (k === 'jb') return /Options from|no flights|not available/i.test(t);
+          if (k === 'an') return /\bUAL\d+\b|Not found|No flights/i.test(t);
+          return document.querySelector('table tr td') || /FLIGHT STATUS|Aircraft details/i.test(t);
+        }, kind, { timeout: kind === 'jb' ? 30000 : 15000 }).catch(() => {});
       }
       return await page.evaluate(st => ({
         status: st,
