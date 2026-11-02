@@ -39,7 +39,7 @@ function config() {
     enRouteMarginMin: envInt('FV_ENROUTE_MARGIN_MIN', 10),
     maxDistanceMi: envInt('FV_MAX_DISTANCE_MI', 1150),
     // where to read a plane's upcoming flights once its tail number is known (first that works)
-    scheduleOrder: (process.env.FV_SCHEDULE_ORDER || 'flightaware,fr24').split(',').map(x => x.trim().toLowerCase()).filter(Boolean),
+    scheduleOrder: (process.env.FV_SCHEDULE_ORDER || 'flightaware,airnav,fr24').split(',').map(x => x.trim().toLowerCase()).filter(Boolean),
     turnaroundMin: 35,
     thresholdMin: 30
   };
@@ -70,7 +70,7 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
   const seedKeys = new Set();
   const tailsDone = new Set();
   const stats = { boardRows: 0, flightsChecked: 0, confirmedCandidates: 0, longSkipped: 0, aircraftFollowed: 0,
-    aircraftNotLateEnough: 0, inboundAttached: 0, fr24Tails: 0, faSchedules: 0, fr24Schedules: 0, tailsVerified: 0, tailsNotVerified: 0, legsLinked: 0, fallbackLinks: 0, swaps: 0, linkConflicts: 0 };
+    aircraftNotLateEnough: 0, inboundAttached: 0, fr24Tails: 0, airnavTails: 0, faSchedules: 0, airnavSchedules: 0, fr24Schedules: 0, tailsVerified: 0, tailsNotVerified: 0, legsLinked: 0, fallbackLinks: 0, swaps: 0, linkConflicts: 0 };
 
   // ---------- page access ----------
   async function get(source, url) {
@@ -250,12 +250,15 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
     const sd = ms(sr.scheduled_out);
     const depDate = sr.scheduled_out ? src.localDate(sr.scheduled_out, origin) : s.date;   // actual local departure date
 
-    // ---- 1. Tail number: Flightradar24 flight page; else United fleet number (verified table) ----
+    // ---- 1. Tail number: AirNav Radar, then Flightradar24 flight page, then United fleet number ----
     let tailSource = null, scheduleFrom = null;
-    const frf = await get('fr24', src.fr24FlightUrl(numOf(sr)));
+    const anf = await get('airnav', src.airnavFlightUrl(numOf(sr)));
+    const anTail = anf ? src.parseAirnavFlight(anf, origin, depDate) : null;
+    if (anTail) { tail = anTail; tailSource = 'airnav'; }
+    const frf = tail ? null : await get('fr24', src.fr24FlightUrl(numOf(sr)));
     const frTail = frf ? src.parseFr24Flight(frf, origin, depDate) : null;
     if (frTail) { tail = frTail; tailSource = 'fr24'; }
-    else {
+    else if (!tail) {
       const up = await get('united', src.unitedUrl(numOf(sr), depDate, origin, dest));
       const ui = up ? src.parseUnited(up) : null;
       if (ui && ui.fleet) { sr._fv.fleet = ui.fleet; const t = src.tailForFleet(ui.fleet); if (t) { tail = t; tailSource = 'fleet'; } }
@@ -268,17 +271,19 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
       for (const which of cfg.scheduleOrder) {
         let legs = null;
         if (which === 'flightaware') { const p = await get('flightaware', src.faHistoryUrl(tail)); legs = p ? src.parseFaHistory(p, tail) : null; }
+        else if (which === 'airnav') { const p = await get('airnav', src.airnavAircraftUrl(tail)); legs = p ? src.parseAirnavAircraft(p) : null; }
         else if (which === 'fr24') { const p = await get('fr24', src.fr24AircraftUrl(tail)); legs = p ? src.parseFr24Aircraft(p) : null; }
         if (!legs || !legs.length) continue;
         // the plane's page must contain this exact flight before its later flights are trusted
         const idx = legs.findIndex(l => l.from === origin && l.to === dest && Math.abs(ms(l.depIso) - sd) <= 90 * MIN && (!l.number || l.number === numOf(sr)));
         if (idx >= 0) { verifiedLegs = legs.slice(idx + 1); scheduleFrom = which; break; }
-        notes.push(`${which === 'fr24' ? 'Flightradar24' : 'FlightAware'}: ${sr.ident} not on ${tail}'s page`);
+        notes.push(`${{ fr24: 'Flightradar24', airnav: 'AirNav', flightaware: 'FlightAware' }[which]}: ${sr.ident} not on ${tail}'s page`);
       }
       if (verifiedLegs) {
         sr._fv.tail = tail; stats.tailsVerified++;
         if (tailSource === 'fr24') stats.fr24Tails++;
-        stats[scheduleFrom === 'flightaware' ? 'faSchedules' : 'fr24Schedules']++;
+        if (tailSource === 'airnav') stats.airnavTails++;
+        stats[{ flightaware: 'faSchedules', airnav: 'airnavSchedules', fr24: 'fr24Schedules' }[scheduleFrom]]++;
       } else {
         stats.tailsNotVerified++;
         notes.push(`${tailSource === 'fleet' ? `fleet #${sr._fv.fleet} -> ` : ''}${tail} not confirmed for ${sr.ident} - using previous-flight check`);
