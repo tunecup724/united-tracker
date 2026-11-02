@@ -368,7 +368,7 @@ async function checkJetBlue() {
   const rows = [...acc.confirmed, ...acc.predicted].sort((a, b) => new Date(a.schedDepIso) - new Date(b.schedDepIso));
   const todo = [...new Map(rows.map(f => [jbKey(f), f])).entries()].filter(([k]) => !cache.jetblue[k]);
   const L = fetchers.createLoader({ maxPages: JB_MAX_PAGES });
-  let done = 0, refused = null;
+  let done = 0, refused = null, jbSample = null;
   const base = cache.scanProgress;
   const apply = () => { for (const f of cache.data) { const r = cache.jetblue[jbKey(f)]; if (r) f.jetblue = jbSummary(r, f.flightNum); } };
   try {
@@ -379,7 +379,11 @@ async function checkJetBlue() {
         if (refused) return;
         const url = sources.jetblueUrl(f.depAirport, f.dest, localDateIn(f.schedDepIso, f._tz));
         let r;
-        try { r = sources.parseJetBlue(await L.get('jetblue', url)); }
+        try {
+          const pg = await L.get('jetblue', url);
+          r = sources.parseJetBlue(pg);
+          if (r.status === 'unknown' && !jbSample) jbSample = String(pg.text || '').replace(/\s+/g, ' ').trim().slice(0, 160) || '(blank page)';
+        }
         catch (e) {
           if (e instanceof fetchers.SiteBlockedError) { refused = e.message; return; }
           if (e instanceof fetchers.LimitError) { refused = `JetBlue page limit (${JB_MAX_PAGES}) reached`; return; }
@@ -392,7 +396,8 @@ async function checkJetBlue() {
     }));
   } finally { await L.close(); }
   const avail = Object.values(cache.jetblue).filter(r => r.status === 'available').length;
-  return `JetBlue: ${done} route(s) checked, ${avail} with award seats` + (refused ? ` (stopped: ${refused})` : '');
+  return `JetBlue: ${done} route(s) checked, ${avail} with award seats` + (refused ? ` (stopped: ${refused})` : '') +
+    (jbSample ? ` | JetBlue page not readable, it showed: "${jbSample}"` : '');
 }
 
 // Turns FlightView records into dashboard rows with the same rules as before.
@@ -454,7 +459,8 @@ async function runFlightViewSearch(job) {
       ? { FlightView: { fetched: result.counts.flightview, error: result.stoppedReason || null },
           United: { fetched: result.counts.united, error: null },
           FlightAwareWeb: { fetched: result.counts.flightaware, error: null },
-          Flightradar24: { fetched: result.counts.fr24 || 0, error: null } }
+          Flightradar24: { fetched: result.counts.fr24 || 0, error: null },
+          AirNav: { fetched: result.counts.airnav || 0, error: null } }
       : { FlightView: { fetched: result.pages, error: result.stoppedReason || null } };
     cache.source = 'flightview';
     cache.discoveryStats = result.stats || null;
@@ -529,7 +535,7 @@ app.get('/api/flightview/status', (req, res) => {
     const exe = process.env.FV_CHROMIUM_PATH || pw.chromium.executablePath();
     browser.chromium = !!exe && require('fs').existsSync(exe);
   } catch (e) { browser.error = e.message.split('\n')[0]; }
-  const sources = { flightview: fetchers.sourceMode('flightview'), united: fetchers.sourceMode('united'), flightawareWeb: fetchers.sourceMode('flightaware'), fr24: fetchers.sourceMode('fr24'), jetblue: fetchers.sourceMode('jetblue') };
+  const sources = { flightview: fetchers.sourceMode('flightview'), united: fetchers.sourceMode('united'), flightawareWeb: fetchers.sourceMode('flightaware'), fr24: fetchers.sourceMode('fr24'), airnav: fetchers.sourceMode('airnav'), jetblue: fetchers.sourceMode('jetblue') };
   res.json({ mode: flightview.mode(), sources, browser, maxFlights: c.maxFlights, maxPages: c.maxPages, prevDepth: c.prevDepth, pageGapMs: c.pageGapMs,
     discovery: discovery.config(), speed: fetchers.speedConfig(), maxDurationMin: FV_MAX_DURATION_MIN, lastDiscovery: cache.discoveryStats || null, coverage: cache.coverage || null, busy: cache.refreshing });
 });
