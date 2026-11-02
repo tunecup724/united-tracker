@@ -1,7 +1,7 @@
 // fetchers.js - loads pages for the discovery search (FlightView, United, FlightAware website).
 //
 // Each site has its own switch; all are OFF unless set to "true" in Railway:
-//   FLIGHTVIEW_LIVE, UNITED_LIVE, FLIGHTAWARE_WEB_LIVE
+//   FLIGHTVIEW_LIVE, UNITED_LIVE, FLIGHTAWARE_WEB_LIVE, FR24_LIVE, JETBLUE_LIVE
 // FV_FIXTURE_DIR (testing): read saved pages from a folder instead of any website.
 //
 // Speed settings (per site): FV_CONCURRENCY pages at once (default 2) and at least
@@ -15,6 +15,7 @@ const path = require('path');
 class BlockedError extends Error {}
 class DisabledError extends Error {}
 class LimitError extends Error {}
+class SiteBlockedError extends Error {}   // one site refused or challenged us; stop using that site this search
 
 const envInt = (n, d) => { const v = parseInt(process.env[n], 10); return Number.isFinite(v) && v >= 0 ? v : d; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -22,11 +23,13 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const SOURCES = {
   flightview:  { flag: 'FLIGHTVIEW_LIVE',      short: 'fv' },
   united:      { flag: 'UNITED_LIVE',          short: 'ua' },
-  flightaware: { flag: 'FLIGHTAWARE_WEB_LIVE', short: 'fa' }
+  flightaware: { flag: 'FLIGHTAWARE_WEB_LIVE', short: 'fa' },
+  fr24:        { flag: 'FR24_LIVE',            short: 'fr' },
+  jetblue:     { flag: 'JETBLUE_LIVE',         short: 'jb' }
 };
-const REAL_BASE = { flightview: 'https://www.flightview.com', united: 'https://www.united.com', flightaware: 'https://www.flightaware.com' };
+const REAL_BASE = { flightview: 'https://www.flightview.com', united: 'https://www.united.com', flightaware: 'https://www.flightaware.com', fr24: 'https://www.flightradar24.com', jetblue: 'https://www.jetblue.com' };
 // Test-only base URL overrides (point a source at a local test server).
-const TEST_ENV = { flightview: 'FV_TEST_BASE_URL', united: 'UA_TEST_BASE_URL', flightaware: 'FA_TEST_BASE_URL' };
+const TEST_ENV = { flightview: 'FV_TEST_BASE_URL', united: 'UA_TEST_BASE_URL', flightaware: 'FA_TEST_BASE_URL', fr24: 'FR24_TEST_BASE_URL', jetblue: 'JB_TEST_BASE_URL' };
 const base = src => (process.env[TEST_ENV[src]] || REAL_BASE[src]).replace(/\/$/, '');
 
 function sourceMode(src) {
@@ -61,9 +64,11 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
   const fixDir = process.env.FV_FIXTURE_DIR || '';
   const fixDelay = envInt('FV_FIXTURE_DELAY_MS', 0);
   const cache = new Map();                 // url -> Promise(page)
-  const counts = { flightview: 0, united: 0, flightaware: 0 };
+  const counts = { flightview: 0, united: 0, flightaware: 0, fr24: 0, jetblue: 0 };
   const active = {}, waiters = {}, nextStart = {};
-  let total = 0, blocked = null;
+  let total = 0, blocked = null, loaded = 0;
+  const loadedUrls = new Set();
+  const siteBlocked = {};                  // united / flightaware: refused or challenged -> skip for the rest of the search
   let browser = null, context = null, launching = null;
 
   async function acquire(src) {
@@ -100,12 +105,20 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
     const ctx = await ensureBrowser();
     const page = await ctx.newPage();
     try {
-      const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      let resp;
+      try { resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }); }
+      catch (e) {
+        const code = (String(e.message).match(/net::ERR_[A-Z0-9_]+/) || [])[0];
+        if (code && !/TIMED_OUT|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED/.test(code)) {
+          const err = new Error(`connection refused (${code})`); err.refused = true; throw err;
+        }
+        throw new Error(String(e.message).split('\n')[0]);
+      }
       const status = resp ? resp.status() : 0;
       if (status < 400) {
         await page.waitForFunction(() => {
           const t = document.body ? document.body.innerText : '';
-          return document.querySelector('table tr td') || /FLIGHT STATUS|Aircraft details|captcha|verify you are human|access denied/i.test(t);
+          return document.querySelector('table tr td') || /FLIGHT STATUS|Aircraft details|Options from|no flights|captcha|verify you are human|access denied/i.test(t);
         }, null, { timeout: 15000 }).catch(() => {});
       }
       return await page.evaluate(st => ({
@@ -119,37 +132,56 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
 
   function fixture(src, url) {
     const tryFiles = [fixtureKey(src, url)];
+    const all = path.join(fixDir, `${SOURCES[src].short}__ALL.json`);            // testing: one page for every URL of a site
+    if (fs.existsSync(all)) tryFiles.unshift(`${SOURCES[src].short}__ALL.json`);
     if (src === 'flightview') {                       // simple names used by tests
       const m = url.match(/\/flight-tracker\/([A-Z0-9]{2})\/(\d+)/);
       if (m) tryFiles.push(`${m[1]}${m[2]}.json`);
     }
     for (const f of tryFiles) {
       const p = path.join(fixDir, f);
-      if (fs.existsSync(p)) return { tables: [], links: [], ...JSON.parse(fs.readFileSync(p, 'utf8')) };
+      if (fs.existsSync(p)) {
+        const d = JSON.parse(fs.readFileSync(p, 'utf8'));
+        if (d.netError) { const err = new Error(`connection refused (${d.netError})`); err.refused = true; throw err; }   // testing
+        return { tables: [], links: [], ...d };
+      }
     }
     return { status: 404, text: '', links: [], tables: [] };
   }
 
   return {
     counts,
-    get total() { return total; },
-    get uniqueUrls() { return cache.size; },
+    get total() { return loaded; },                       // pages actually loaded
+    get uniqueUrls() { return loadedUrls.size; },
     get blocked() { return blocked; },
+    get siteBlocked() { return { ...siteBlocked }; },
     get(src, url) {
       if (blocked) return Promise.reject(new BlockedError(blocked));
+      if (siteBlocked[src]) return Promise.reject(new SiteBlockedError(siteBlocked[src]));
       if (cache.has(url)) return cache.get(url);              // never download the same page twice
       const mode = sourceMode(src);
       if (mode === 'disabled') return Promise.reject(new DisabledError(`${src} live retrieval is off`));
       if (total >= maxPages) return Promise.reject(new LimitError(`page limit (${maxPages}) reached`));
-      total++; counts[src]++;
+      total++;                                               // reserve a slot under the page limit
       const p = (async () => {
         await acquire(src);
         try {
-          if (blocked) throw new BlockedError(blocked);
-          onPage(src, url, total);
+          if (blocked) { total--; throw new BlockedError(blocked); }
+          if (siteBlocked[src]) { total--; throw new SiteBlockedError(siteBlocked[src]); }
+          loaded++; counts[src]++; loadedUrls.add(url);
+          onPage(src, url, loaded);
           if (mode === 'fixtures' && fixDelay) await sleep(fixDelay);
-          const page = mode === 'fixtures' ? fixture(src, url) : await live(url);
-          try { checkBlocked(src, page); } catch (e) { blocked = blocked || e.message; throw e; }
+          let page;
+          try {
+            page = mode === 'fixtures' ? fixture(src, url) : await live(url);
+            checkBlocked(src, page);
+          } catch (e) {
+            if (!(e instanceof BlockedError) && !e.refused) throw e;           // ordinary error (e.g. timeout): just this page
+            const msg = e.refused ? `${src}: ${e.message} - stopped using ${src}` : e.message;
+            if (src === 'flightview') { blocked = blocked || msg; throw new BlockedError(msg); }   // FlightView: stop the search
+            siteBlocked[src] = siteBlocked[src] || msg;                                          // United / FlightAware: stop that site
+            throw new SiteBlockedError(msg);
+          }
           return page;
         } finally { release(src); }
       })();
@@ -160,4 +192,4 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
   };
 }
 
-module.exports = { createLoader, sourceMode, speedConfig, fixtureKey, base, BlockedError, DisabledError, LimitError, SOURCES };
+module.exports = { createLoader, sourceMode, speedConfig, fixtureKey, base, BlockedError, DisabledError, LimitError, SiteBlockedError, SOURCES };
