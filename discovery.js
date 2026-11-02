@@ -17,7 +17,7 @@
 
 const fv = require('./flightview');
 const src = require('./sources');
-const { createLoader, BlockedError, DisabledError, LimitError } = require('./fetchers');
+const { createLoader, BlockedError, DisabledError, LimitError, SiteBlockedError } = require('./fetchers');
 
 const envInt = (n, d) => { const v = parseInt(process.env[n], 10); return Number.isFinite(v) && v >= 0 ? v : d; };
 const envList = (n, d) => (process.env[n] || d).split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
@@ -38,6 +38,8 @@ function config() {
     minGroundMin: envInt('FV_MIN_GROUND_MIN', 20),
     enRouteMarginMin: envInt('FV_ENROUTE_MARGIN_MIN', 10),
     maxDistanceMi: envInt('FV_MAX_DISTANCE_MI', 1150),
+    // where to read a plane's upcoming flights once its tail number is known (first that works)
+    scheduleOrder: (process.env.FV_SCHEDULE_ORDER || 'flightaware,fr24').split(',').map(x => x.trim().toLowerCase()).filter(Boolean),
     turnaroundMin: 35,
     thresholdMin: 30
   };
@@ -56,6 +58,7 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
   const off = new Set();
   let halt = null;                         // reason the search stopped early
   let stoppedReason = null;                // a block (shown as an error)
+  let pageErrors = 0;
 
   const records = new Map();               // recKey -> tracker-shaped flight
   const primary = new Set();
@@ -63,11 +66,11 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
   const boardCache = new Map();            // "AP|kind" -> Promise<rows | null>
   const routeCache = new Map();
   const hubSet = new Set(cfg.hubs);
-  const airportsQueued = new Set(), airportsDone = new Set(), airportsFailed = new Set();
+  const airportsQueued = new Set(), airportsDone = new Set(), airportsFailed = new Set(), airportsNoList = new Set();
   const seedKeys = new Set();
   const tailsDone = new Set();
   const stats = { boardRows: 0, flightsChecked: 0, confirmedCandidates: 0, longSkipped: 0, aircraftFollowed: 0,
-    aircraftNotLateEnough: 0, tailsVerified: 0, tailsNotVerified: 0, legsLinked: 0, fallbackLinks: 0, swaps: 0, linkConflicts: 0 };
+    aircraftNotLateEnough: 0, inboundAttached: 0, fr24Tails: 0, faSchedules: 0, fr24Schedules: 0, tailsVerified: 0, tailsNotVerified: 0, legsLinked: 0, fallbackLinks: 0, swaps: 0, linkConflicts: 0 };
 
   // ---------- page access ----------
   async function get(source, url) {
@@ -77,7 +80,13 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
       if (e instanceof DisabledError) { off.add(source); if (source === 'flightview') halt = halt || 'FlightView live retrieval is off'; return null; }
       if (e instanceof LimitError) { halt = halt || e.message; return null; }
       if (isBlock(e)) { stoppedReason = stoppedReason || e.message; halt = halt || e.message; return null; }
-      throw e;
+      if (e instanceof SiteBlockedError) {
+        if (!off.has(source)) { off.add(source); notes.unshift(`${e.message} - used FlightView previous-flight check instead`); }
+        return null;
+      }
+      pageErrors++;
+      if (pageErrors <= 3) notes.push(`page error: ${String(e.message).split('\n')[0].slice(0, 120)}`);
+      return null;                                              // just this page; the check carries on without it
     }
   }
 
@@ -106,7 +115,11 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
       const page = await get('flightview', src.boardUrl(ap, kind));
       if (!page) return null;
       const rows = src.parseBoard(page, ap, kind, now);
-      if (!rows) { airportsFailed.add(ap); notes.push(`${ap} ${kind} board not readable`); return null; }
+      if (!rows) {
+        if (/error fetching the specified airport flights/i.test(page.text || '')) airportsNoList.add(ap);
+        else { airportsFailed.add(ap); notes.push(`${ap} ${kind} board not readable`); }
+        return null;
+      }
       stats.boardRows += rows.length;
       airportsDone.add(ap);
       return rows;
@@ -199,7 +212,12 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
           stats.confirmedCandidates++;
           push(ms(r.schedIso), async () => {
             const f = await flight({ airline: 'UA', number: r.number, date: src.localDate(r.schedIso, r.airport), depapt: r.airport });
-            if (f) { primary.add(f.recKey); dirty = true; }
+            if (!f) return;
+            primary.add(f.recKey); dirty = true;
+            if (f.prev && !f.rec._fv.prevKey) {
+              const inb = await flight({ airline: f.prev.airline || 'UA', number: f.prev.number, date: f.prev.date, depapt: f.prev.depapt });
+              if (inb && inb.recKey !== f.recKey) { f.rec._fv.prevKey = inb.recKey; dirty = true; stats.inboundAttached++; }
+            }
           });
         }
       }
@@ -228,20 +246,44 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
     stats.aircraftFollowed++;
     const origin = sr.origin.code_iata, dest = sr.destination.code_iata;
 
-    // ---- tail number from a verified fleet pair ----
     let verifiedLegs = null, tail = null;
-    const up = await get('united', src.unitedUrl(numOf(sr), s.date, origin, dest));
-    const ui = up ? src.parseUnited(up) : null;
-    if (ui && ui.fleet) { sr._fv.fleet = ui.fleet; tail = src.tailForFleet(ui.fleet); }
+    const sd = ms(sr.scheduled_out);
+    const depDate = sr.scheduled_out ? src.localDate(sr.scheduled_out, origin) : s.date;   // actual local departure date
+
+    // ---- 1. Tail number: Flightradar24 flight page; else United fleet number (verified table) ----
+    let tailSource = null, scheduleFrom = null;
+    const frf = await get('fr24', src.fr24FlightUrl(numOf(sr)));
+    const frTail = frf ? src.parseFr24Flight(frf, origin, depDate) : null;
+    if (frTail) { tail = frTail; tailSource = 'fr24'; }
+    else {
+      const up = await get('united', src.unitedUrl(numOf(sr), depDate, origin, dest));
+      const ui = up ? src.parseUnited(up) : null;
+      if (ui && ui.fleet) { sr._fv.fleet = ui.fleet; const t = src.tailForFleet(ui.fleet); if (t) { tail = t; tailSource = 'fleet'; } }
+    }
+
+    // ---- 2. That plane's upcoming flights: FlightAware aircraft page first, Flightradar24's as backup ----
     if (tail) {
       if (tailsDone.has(tail)) return;           // same plane already being followed by another task
       tailsDone.add(tail);
-      const fp = await get('flightaware', src.faHistoryUrl(tail));
-      const legs = fp ? src.parseFaHistory(fp, tail) : null;
-      const sd = ms(sr.scheduled_out);
-      const idx = legs ? legs.findIndex(l => l.from === origin && l.to === dest && Math.abs(ms(l.depIso) - sd) <= 90 * MIN) : -1;
-      if (idx >= 0) { verifiedLegs = legs.slice(idx + 1); sr._fv.tail = tail; stats.tailsVerified++; }
-      else { stats.tailsNotVerified++; notes.push(`fleet #${ui.fleet} -> ${tail} not confirmed for ${sr.ident} - using previous-flight check`); }
+      for (const which of cfg.scheduleOrder) {
+        let legs = null;
+        if (which === 'flightaware') { const p = await get('flightaware', src.faHistoryUrl(tail)); legs = p ? src.parseFaHistory(p, tail) : null; }
+        else if (which === 'fr24') { const p = await get('fr24', src.fr24AircraftUrl(tail)); legs = p ? src.parseFr24Aircraft(p) : null; }
+        if (!legs || !legs.length) continue;
+        // the plane's page must contain this exact flight before its later flights are trusted
+        const idx = legs.findIndex(l => l.from === origin && l.to === dest && Math.abs(ms(l.depIso) - sd) <= 90 * MIN && (!l.number || l.number === numOf(sr)));
+        if (idx >= 0) { verifiedLegs = legs.slice(idx + 1); scheduleFrom = which; break; }
+        notes.push(`${which === 'fr24' ? 'Flightradar24' : 'FlightAware'}: ${sr.ident} not on ${tail}'s page`);
+      }
+      if (verifiedLegs) {
+        sr._fv.tail = tail; stats.tailsVerified++;
+        if (tailSource === 'fr24') stats.fr24Tails++;
+        stats[scheduleFrom === 'flightaware' ? 'faSchedules' : 'fr24Schedules']++;
+      } else {
+        stats.tailsNotVerified++;
+        notes.push(`${tailSource === 'fleet' ? `fleet #${sr._fv.fleet} -> ` : ''}${tail} not confirmed for ${sr.ident} - using previous-flight check`);
+        tail = null;
+      }
     }
 
     let prev = seed, prevEff = E;
@@ -274,6 +316,8 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
   async function legFlight(leg) {
     const ld = ms(leg.depIso);
     const date = src.localDate(leg.depIso, leg.from);
+    if (leg.number) return flight({ airline: 'UA', number: leg.number, date, depapt: leg.from });   // Flightradar24 gives the number
+    if (leg.ident) { notes.push(`next flight ${leg.ident} is not a United flight - stopped following`); return null; }
     let num = null;
     if (ld - now <= 3 * 3600000) {
       const rows = await board(leg.from, 'departures');
@@ -319,7 +363,7 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
           if (!t) { if (running === 0) return; await sleep(25); continue; }
           running++;
           try { await t.fn(); }
-          catch (e) { if (isBlock(e)) { stoppedReason = stoppedReason || e.message; halt = halt || e.message; } else notes.push(`error: ${e.message}`); }
+          catch (e) { if (isBlock(e)) { stoppedReason = stoppedReason || e.message; halt = halt || e.message; } else notes.push(`error: ${String(e.message).split('\n')[0].slice(0, 120)}`); }
           finally { running--; emit(false); }
         }
       }));
@@ -330,13 +374,15 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
 
   const tasksLeft = tasks.length;
   const partial = !!halt || tasksLeft > 0;
-  for (const s of off) if (s !== 'flightview') notes.push(`${s} is off - used previous-flight check instead of tail numbers`);
+  for (const s of off) if (s !== 'flightview' && !(L.siteBlocked || {})[s]) notes.push(`${s} is off - used previous-flight check instead of tail numbers`);
   const coverage = {
     partial,
     reason: halt || null,
     airportsChecked: airportsDone.size,
     airportsQueued: airportsQueued.size,
     airportsFailed: airportsFailed.size,
+    airportsNoList: airportsNoList.size,
+    sitesRefused: Object.keys(L.siteBlocked || {}),
     tasksNotDone: tasksLeft,
     elapsedSec: Math.round((Date.now() - t0) / 1000),
     pages: L.total,
