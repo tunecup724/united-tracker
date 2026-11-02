@@ -59,6 +59,9 @@
   .jb-btn { display: inline-block; background: #00205b; color: #fff; font-size: 10px; font-weight: 700; font-family: monospace; padding: 5px 10px; border-radius: 4px; text-decoration: none; white-space: nowrap; border: 1px solid #003399; }
   .slip-bad { background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.3); padding: 3px 8px; border-radius: 4px; font-size: 10px; font-family: monospace; font-weight: 700; white-space: nowrap; }
   .slip-ok { background: rgba(34,197,94,0.12); color: #22c55e; border: 1px solid rgba(34,197,94,0.25); padding: 3px 8px; border-radius: 4px; font-size: 10px; font-family: monospace; font-weight: 700; white-space: nowrap; }
+  .jb-ok { color: #22c55e; font-family: monospace; font-size: 10px; font-weight: 700; margin-top: 4px; white-space: nowrap; }
+  .jb-no { color: #ef4444; font-family: monospace; font-size: 10px; font-weight: 700; margin-top: 4px; white-space: nowrap; }
+  .jb-unk { color: #4a6080; font-family: monospace; font-size: 10px; margin-top: 4px; white-space: nowrap; }
   .pred-tag { background: rgba(124,58,237,0.15); color: #a78bfa; border: 1px solid rgba(124,58,237,0.35); padding: 3px 8px; border-radius: 4px; font-size: 10px; font-family: monospace; font-weight: 700; white-space: nowrap; }
 </style>
 </head>
@@ -195,6 +198,19 @@ function jetblueUrl(origin, dest) {
   return 'https://www.jetblue.com/booking/flights?from=' + origin + '&to=' + dest + '&depart=' + dateStr + '&isMultiCity=false&noOfRoute=1&adults=1&children=0&infants=0&usePoints=true';
 }
 
+function kPts(n) { return n >= 1000 ? (Math.round(n / 100) / 10) + 'k pts' : n + ' pts'; }
+function awardCell(f) {
+  const j = f.jetblue;
+  const link = '<a href="' + (j && j.url ? j.url : jetblueUrl(f.depAirport, f.dest)) + '" target="_blank" class="jb-btn">JetBlue</a>';
+  if (!j) return link;
+  if (j.status === 'available') {
+    const main = j.own ? 'THIS FLIGHT ' + kPts(j.own.points) : j.count + ' option' + (j.count === 1 ? '' : 's');
+    return link + '<div class="jb-ok">&#10003; ' + main + ' &middot; from ' + kPts(j.minPoints) + '</div>';
+  }
+  if (j.status === 'none') return link + '<div class="jb-no">&#10007; NO AWARD SEATS</div>';
+  return link + '<div class="jb-unk">? not readable</div>';
+}
+
 function currentFiltered() {
   let list = allFlights;
   if (activeType === 'CONFIRMED') list = list.filter(f => !f.predicted);
@@ -267,7 +283,7 @@ function renderTable(flights) {
       '<td style="font-family:monospace;color:#8899aa">' + fmtDur(f.duration) + '</td>' +
       '<td>' + pill(f.status) + '</td>' +
       '<td>' + (f.predicted ? '<span class="pred-tag">PRE-DELAY</span>' : riskTag(f.risk)) + '</td>' +
-      '<td><a href="' + jetblueUrl(f.depAirport, f.dest) + '" target="_blank" class="jb-btn">JetBlue</a></td>' +
+      '<td>' + awardCell(f) + '</td>' +
       '</tr>';
   }).join('');
 }
