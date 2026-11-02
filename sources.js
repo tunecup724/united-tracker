@@ -43,13 +43,26 @@ function timeNearest(t, code, nowMs) {
   if (!t || !/\d{1,2}:\d{2}\s*[AP]M/i.test(t)) return null;
   const tm = t.match(/\d{1,2}:\d{2}\s*[AP]M/i)[0];
   let best = null;
-  for (const dd of [-1, 0, 1]) {
-    const d = new Date(nowMs + dd * 86400000);
-    const [y, m, day] = localDate(d.toISOString(), code).split('-').map(Number);
-    const iso = localToIso(`${tm}, ${MON[m - 1]} ${day}`, code, Date.UTC(y, m - 1, day, 12));
+  const [y0, m0, d0] = localDate(new Date(nowMs).toISOString(), code).split('-').map(Number);
+  for (const dd of [-1, 0, 1]) {                       // yesterday / today / tomorrow by calendar date
+    const d = new Date(Date.UTC(y0, m0 - 1, d0 + dd));
+    const iso = localToIso(`${tm}, ${MON[d.getUTCMonth()]} ${d.getUTCDate()}`, code, d.getTime() + 12 * 3600000);
     if (iso && (best === null || Math.abs(Date.parse(iso) - nowMs) < Math.abs(Date.parse(best) - nowMs))) best = iso;
   }
   return best;
+}
+// Local clock time "h:mm AM" at airport, on startYmd or the next day(s) - the first that is not before notBeforeMs.
+// Converts each calendar date separately, so daylight-saving changes are handled correctly.
+function localOnOrAfter(t, startYmd, code, notBeforeMs) {
+  const m = String(t || '').match(/(\d{1,2}):(\d{2})\s*([AP])M/i);
+  if (!m || !startYmd) return null;
+  const [y, mo, d] = startYmd.split('-').map(Number);
+  for (let k = 0; k < 3; k++) {
+    const day = new Date(Date.UTC(y, mo - 1, d + k));
+    const iso = localToIso(`${+m[1]}:${m[2]} ${m[3]}M, ${MON[day.getUTCMonth()]} ${day.getUTCDate()}`, code, day.getTime() + 12 * 3600000);
+    if (iso && Date.parse(iso) >= notBeforeMs) return iso;
+  }
+  return null;
 }
 const code3 = s => { const m = String(s || '').match(/\(([A-Z0-9]{3})\)/); return m ? m[1] : null; };
 
@@ -144,21 +157,124 @@ function parseFaHistory(page, tail) {
     const d = lm[1], hm = lm[2];
     const depMs = Date.UTC(+d.slice(0, 4), +d.slice(4, 6) - 1, +d.slice(6, 8), +hm.slice(0, 2), +hm.slice(2, 4));
     // arrival "07:35PM MST" is local at destination; place it on/after the departure
-    let arrIso = null;
-    const am = (row[5] || '').match(/(\d{1,2}):(\d{2})\s*([AP])M/i);
-    if (am && AIRPORT_TZ[to]) {
-      const depLocal = localDate(new Date(depMs).toISOString(), to);
-      const [y, m, day] = depLocal.split('-').map(Number);
-      let a = Date.parse(localToIso(`${+am[1]}:${am[2]} ${am[3]}M, ${MON[m - 1]} ${day}`, to, Date.UTC(y, m - 1, day, 12)));
-      if (a < depMs) a += 86400000;
-      arrIso = new Date(a).toISOString();
-    }
+    const arrIso = AIRPORT_TZ[to] ? localOnOrAfter(row[5], localDate(new Date(depMs).toISOString(), to), to, depMs) : null;
     legs.push({ from, to, depIso: new Date(depMs).toISOString(), arrIso, status: row[6] || '' });
   });
   return legs.sort((a, b) => Date.parse(a.depIso) - Date.parse(b.depIso));
 }
 
+// ---------- Flightradar24 (tail number by flight, upcoming flights by tail) ----------
+const fr24FlightUrl = num => `${base('fr24')}/data/flights/ua${num}`;
+const fr24AircraftUrl = tail => `${base('fr24')}/data/aircraft/${String(tail).toLowerCase()}`;
+const MON_IDX = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 };
+function fr24Date(s) {                       // "02 Nov 2026" -> "2026-11-02"
+  const m = String(s || '').match(/(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})/);
+  if (!m || MON_IDX[m[2].toUpperCase()] === undefined) return null;
+  return `${m[3]}-${String(MON_IDX[m[2].toUpperCase()] + 1).padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+}
+function fr24Table(page, need) {
+  for (const t of page.tables || []) {
+    const head = (t[0] || []).map(h => h.replace(/\s+/g, ' ').trim().toUpperCase());
+    if (need.every(n => head.includes(n))) return { head, rows: t.slice(1) };
+  }
+  return null;
+}
+// local "6:00 AM" on date "2026-11-02" at airport -> ISO
+function fr24Time(t, ymd, code) {
+  if (!t || !ymd || !/\d{1,2}:\d{2}\s*[AP]M/i.test(t)) return null;
+  const [y, m, d] = ymd.split('-').map(Number);
+  return localToIso(`${t.match(/\d{1,2}:\d{2}\s*[AP]M/i)[0]}, ${MON[m - 1]} ${d}`, code, Date.UTC(y, m - 1, d, 12));
+}
+
+// Flight page: which aircraft (tail) flies UA<num> from depapt on date. -> "N14503" | null
+function parseFr24Flight(page, depapt, ymd) {
+  const t = fr24Table(page, ['DATE', 'FROM', 'TO', 'AIRCRAFT']);
+  if (!t) return null;
+  const i = k => t.head.indexOf(k);
+  for (const r of t.rows) {
+    if (fr24Date(r[i('DATE')]) !== ymd || code3(r[i('FROM')]) !== depapt) continue;
+    const m = String(r[i('AIRCRAFT')] || '').match(/\((N[0-9A-Z]{1,5})\)/i);
+    return m ? m[1].toUpperCase() : null;      // no tail yet = not assigned
+  }
+  return null;
+}
+
+// Aircraft page: the plane's flights, oldest first. -> [{ number, from, to, depIso, arrIso, status }]
+function parseFr24Aircraft(page) {
+  const t = fr24Table(page, ['DATE', 'FROM', 'TO', 'FLIGHT', 'STD', 'STA']);
+  if (!t) return null;
+  const i = k => t.head.indexOf(k);
+  const legs = [];
+  for (const r of t.rows) {
+    const ymd = fr24Date(r[i('DATE')]);
+    const from = code3(r[i('FROM')]), to = code3(r[i('TO')]);
+    const fm = String(r[i('FLIGHT')] || '').match(/^UA(\d{1,4})$/i);
+    if (!ymd || !from || !to) continue;
+    const depIso = fr24Time(r[i('STD')], ymd, from);
+    const arrIso = depIso && AIRPORT_TZ[to] ? localOnOrAfter(r[i('STA')], localDate(depIso, to), to, Date.parse(depIso)) : null;
+    legs.push({ number: fm ? String(parseInt(fm[1], 10)) : null, ident: r[i('FLIGHT')] || '', from, to, depIso, arrIso, status: r[i('STATUS')] || '' });
+  }
+  return legs.filter(l => l.depIso).sort((a, b) => Date.parse(a.depIso) - Date.parse(b.depIso));
+}
+
+// ---------- JetBlue points search (award availability for a route and date) ----------
+function jetblueUrl(from, to, ymd) {
+  const [y, m, d] = ymd.split('-');
+  return `${base('jetblue')}/booking/flights?from=${from}&to=${to}&depart=${m}/${d}/${y}` +
+    '&isMultiCity=false&noOfRoute=1&adults=1&children=0&infants=0&usePoints=true';
+}
+// -> { status: 'available' | 'none' | 'unknown', options: [...], minPoints, nonstop, ownFlight }
+//    ownFlight: the delayed flight itself if it is bookable with points (flightNum like "5132")
+function parseJetBlue(page, ownNumber) {
+  const lines = String(page.text || '').split('\n').map(l => l.trim()).filter(Boolean);
+  const starts = [];
+  lines.forEach((l, i) => { if (/^(Nonstop|\d+\s+Stops?)$/i.test(l)) starts.push(i); });
+  const options = [];
+  starts.forEach((st, k) => {
+    const seg = lines.slice(st, k + 1 < starts.length ? starts[k + 1] : st + 40);
+    const times = seg.filter(l => /^\d{1,2}:\d{2}\s*[ap]m$/i.test(l));
+    const fi = seg.findIndex(l => /^Options from$/i.test(l));
+    const ptsLine = (fi >= 0 ? seg.slice(fi, fi + 3) : seg).find(l => /[\d,]+\s*pts/i.test(l));
+    const fee = seg.find(l => /^\+\$[\d.,]+$/.test(l));
+    // "United UA 51321" -> UA 5132 (a footnote digit is glued on); United numbers have at most 4 digits
+    // A footnote marker can be glued on: "United UA 51321" + next line "1Equipment and crew by..." = UA 5132
+    const flights = [];
+    seg.forEach((l, li) => {
+      const foot = (seg[li + 1] || '').match(/^(\d)[A-Za-z]/);
+      const ms = [...l.matchAll(/\b(UA|B6)\s?(\d{1,5})\b/g)];
+      ms.forEach((m, mi) => {
+        let n = m[2];
+        if (n.length > 4) n = n.slice(0, 4);
+        else if (foot && mi === ms.length - 1 && n.length > 1 && n.endsWith(foot[1]) && /\d$/.test(l)) n = n.slice(0, -1);
+        flights.push(m[1] + n);
+      });
+    });
+    if (!ptsLine) return;
+    options.push({
+      stops: /^nonstop$/i.test(seg[0]) ? 0 : parseInt(seg[0], 10),
+      dep: times[0] || null, arr: times[1] || null,
+      flights: [...new Set(flights)],
+      points: parseInt(ptsLine.match(/([\d,]+)\s*pts/i)[1].replace(/,/g, ''), 10),
+      fee: fee || null
+    });
+  });
+  if (!options.length) {
+    const none = /no (available )?flights|no flights (are )?available|sold out|no results/i.test(page.text || '');
+    return { status: none ? 'none' : 'unknown', options: [], minPoints: null, nonstop: 0, ownFlight: null };
+  }
+  const own = ownNumber ? options.find(o => o.flights.includes('UA' + ownNumber)) || null : null;
+  return {
+    status: 'available',
+    options,
+    minPoints: Math.min(...options.map(o => o.points)),
+    nonstop: options.filter(o => o.stops === 0).length,
+    ownFlight: own ? { points: own.points, fee: own.fee } : null
+  };
+}
+
 module.exports = {
+  jetblueUrl, parseJetBlue,
+  fr24FlightUrl, fr24AircraftUrl, parseFr24Flight, parseFr24Aircraft,
   boardUrl, parseBoard, routeUrl, parseRoute, unitedUrl, parseUnited, tailForFleet,
   faHistoryUrl, parseFaHistory, localDate, timeNearest, icaoToIata, distanceMi, MAX_UA_NUMBER
 };
