@@ -70,7 +70,7 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
   const seedKeys = new Set();
   const tailsDone = new Set();
   const stats = { boardRows: 0, flightsChecked: 0, confirmedCandidates: 0, longSkipped: 0, aircraftFollowed: 0,
-    aircraftNotLateEnough: 0, inboundAttached: 0, fr24Tails: 0, airnavTails: 0, faSchedules: 0, airnavSchedules: 0, fr24Schedules: 0, tailsVerified: 0, tailsNotVerified: 0, legsLinked: 0, fallbackLinks: 0, swaps: 0, linkConflicts: 0 };
+    aircraftNotLateEnough: 0, inboundAttached: 0, fr24Tails: 0, airnavTails: 0, adsbTails: 0, adsbViaInbound: 0, faSchedules: 0, airnavSchedules: 0, fr24Schedules: 0, tailsVerified: 0, tailsNotVerified: 0, legsLinked: 0, fallbackLinks: 0, swaps: 0, linkConflicts: 0 };
 
   // ---------- page access ----------
   async function get(source, url) {
@@ -250,9 +250,23 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
     const sd = ms(sr.scheduled_out);
     const depDate = sr.scheduled_out ? src.localDate(sr.scheduled_out, origin) : s.date;   // actual local departure date
 
-    // ---- 1. Tail number: AirNav Radar, then Flightradar24 flight page, then United fleet number ----
+    // ---- 1. Tail number: adsb.lol (live transponder data), AirNav, Flightradar24, then United fleet number ----
     let tailSource = null, scheduleFrom = null;
-    const anf = await get('airnav', src.airnavFlightUrl(numOf(sr)));
+    // The late flight may not be flying yet, but the plane that will fly it usually is: on its way in
+    // (FlightView's "Aircraft's Previous Flight") or at the gate with its transponder on. Try this
+    // flight's callsign first, then the inbound flight's. The tail is confirmed on the plane's own page below.
+    const adsbNums = [numOf(sr)];
+    if (seed.prev && seed.prev.number && seed.prev.number !== numOf(sr)) adsbNums.push(String(seed.prev.number));
+    adsbLoop:
+    for (const num of adsbNums) {
+      for (const cs of src.adsbCallsigns(num)) {
+        const ap = await get('adsb', src.adsbCallsignUrl(cs));
+        if (ap === null && off.has('adsb')) break adsbLoop;   // switched off or refused
+        const hit = ap ? src.parseAdsb(ap, cs) : null;
+        if (hit) { tail = hit.tail; tailSource = 'adsb'; if (num !== numOf(sr)) stats.adsbViaInbound++; break adsbLoop; }
+      }
+    }
+    const anf = tail ? null : await get('airnav', src.airnavFlightUrl(numOf(sr)));
     const anTail = anf ? src.parseAirnavFlight(anf, origin, depDate) : null;
     if (anTail) { tail = anTail; tailSource = 'airnav'; }
     const frf = tail ? null : await get('fr24', src.fr24FlightUrl(numOf(sr)));
@@ -283,6 +297,7 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
         sr._fv.tail = tail; stats.tailsVerified++;
         if (tailSource === 'fr24') stats.fr24Tails++;
         if (tailSource === 'airnav') stats.airnavTails++;
+        if (tailSource === 'adsb') stats.adsbTails++;
         stats[{ flightaware: 'faSchedules', airnav: 'airnavSchedules', fr24: 'fr24Schedules' }[scheduleFrom]]++;
       } else {
         stats.tailsNotVerified++;
