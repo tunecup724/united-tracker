@@ -460,7 +460,8 @@ async function runFlightViewSearch(job) {
           United: { fetched: result.counts.united, error: null },
           FlightAwareWeb: { fetched: result.counts.flightaware, error: null },
           Flightradar24: { fetched: result.counts.fr24 || 0, error: null },
-          AirNav: { fetched: result.counts.airnav || 0, error: null } }
+          AirNav: { fetched: result.counts.airnav || 0, error: null },
+          adsbLol: { fetched: result.counts.adsb || 0, error: null } }
       : { FlightView: { fetched: result.pages, error: result.stoppedReason || null } };
     cache.source = 'flightview';
     cache.discoveryStats = result.stats || null;
@@ -535,7 +536,7 @@ app.get('/api/flightview/status', (req, res) => {
     const exe = process.env.FV_CHROMIUM_PATH || pw.chromium.executablePath();
     browser.chromium = !!exe && require('fs').existsSync(exe);
   } catch (e) { browser.error = e.message.split('\n')[0]; }
-  const sources = { flightview: fetchers.sourceMode('flightview'), united: fetchers.sourceMode('united'), flightawareWeb: fetchers.sourceMode('flightaware'), fr24: fetchers.sourceMode('fr24'), airnav: fetchers.sourceMode('airnav'), jetblue: fetchers.sourceMode('jetblue') };
+  const sources = { flightview: fetchers.sourceMode('flightview'), united: fetchers.sourceMode('united'), flightawareWeb: fetchers.sourceMode('flightaware'), fr24: fetchers.sourceMode('fr24'), airnav: fetchers.sourceMode('airnav'), adsb: fetchers.sourceMode('adsb'), jetblue: fetchers.sourceMode('jetblue') };
   res.json({ mode: flightview.mode(), sources, browser, maxFlights: c.maxFlights, maxPages: c.maxPages, prevDepth: c.prevDepth, pageGapMs: c.pageGapMs,
     discovery: discovery.config(), speed: fetchers.speedConfig(), maxDurationMin: FV_MAX_DURATION_MIN, lastDiscovery: cache.discoveryStats || null, coverage: cache.coverage || null, busy: cache.refreshing });
 });
