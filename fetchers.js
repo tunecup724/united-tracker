@@ -1,7 +1,7 @@
 // fetchers.js - loads pages for the discovery search (FlightView, United, FlightAware website).
 //
 // Each site has its own switch; all are OFF unless set to "true" in Railway:
-//   FLIGHTVIEW_LIVE, UNITED_LIVE, FLIGHTAWARE_WEB_LIVE, FR24_LIVE, JETBLUE_LIVE, AIRNAV_LIVE
+//   FLIGHTVIEW_LIVE, UNITED_LIVE, FLIGHTAWARE_WEB_LIVE, FR24_LIVE, JETBLUE_LIVE, AIRNAV_LIVE, ADSB_LIVE
 // FV_FIXTURE_DIR (testing): read saved pages from a folder instead of any website.
 //
 // Speed settings (per site): FV_CONCURRENCY pages at once (default 2) and at least
@@ -26,11 +26,12 @@ const SOURCES = {
   flightaware: { flag: 'FLIGHTAWARE_WEB_LIVE', short: 'fa' },
   fr24:        { flag: 'FR24_LIVE',            short: 'fr' },
   jetblue:     { flag: 'JETBLUE_LIVE',         short: 'jb' },
-  airnav:      { flag: 'AIRNAV_LIVE',          short: 'an' }
+  airnav:      { flag: 'AIRNAV_LIVE',          short: 'an' },
+  adsb:        { flag: 'ADSB_LIVE',            short: 'ad' }
 };
-const REAL_BASE = { flightview: 'https://www.flightview.com', united: 'https://www.united.com', flightaware: 'https://www.flightaware.com', fr24: 'https://www.flightradar24.com', jetblue: 'https://www.jetblue.com', airnav: 'https://www.airnavradar.com' };
+const REAL_BASE = { flightview: 'https://www.flightview.com', united: 'https://www.united.com', flightaware: 'https://www.flightaware.com', fr24: 'https://www.flightradar24.com', jetblue: 'https://www.jetblue.com', airnav: 'https://www.airnavradar.com', adsb: 'https://api.adsb.lol' };
 // Test-only base URL overrides (point a source at a local test server).
-const TEST_ENV = { flightview: 'FV_TEST_BASE_URL', united: 'UA_TEST_BASE_URL', flightaware: 'FA_TEST_BASE_URL', fr24: 'FR24_TEST_BASE_URL', jetblue: 'JB_TEST_BASE_URL', airnav: 'AN_TEST_BASE_URL' };
+const TEST_ENV = { flightview: 'FV_TEST_BASE_URL', united: 'UA_TEST_BASE_URL', flightaware: 'FA_TEST_BASE_URL', fr24: 'FR24_TEST_BASE_URL', jetblue: 'JB_TEST_BASE_URL', airnav: 'AN_TEST_BASE_URL', adsb: 'AD_TEST_BASE_URL' };
 const base = src => (process.env[TEST_ENV[src]] || REAL_BASE[src]).replace(/\/$/, '');
 
 function sourceMode(src) {
@@ -52,7 +53,7 @@ function fixtureKey(src, url) {
   return (SOURCES[src].short + u.pathname + (q ? '?' + q : '')).replace(/[^A-Za-z0-9=&?._-]+/g, '_') + '.json';
 }
 
-const BLOCK_PATTERNS = /captcha|verify (that )?you are (a )?human|are you a robot|unusual traffic|access denied|request (has been )?blocked|press (and|&) hold|checking your browser|pardon our interruption/i;
+const BLOCK_PATTERNS = /captcha|verify (that )?you are (a )?human|are you a robot|unusual traffic|access denied|request (has been )?blocked|press (and|&) hold|checking your browser|verifying your browser|pardon our interruption|just a moment\.\.\./i;
 
 function checkBlocked(src, page) {
   if (page.status && [401, 403, 407, 429, 451, 503].includes(page.status)) throw new BlockedError(`${src}: HTTP ${page.status} - stopped`);
@@ -65,7 +66,7 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
   const fixDir = process.env.FV_FIXTURE_DIR || '';
   const fixDelay = envInt('FV_FIXTURE_DELAY_MS', 0);
   const cache = new Map();                 // url -> Promise(page)
-  const counts = { flightview: 0, united: 0, flightaware: 0, fr24: 0, jetblue: 0, airnav: 0 };
+  const counts = { flightview: 0, united: 0, flightaware: 0, fr24: 0, jetblue: 0, airnav: 0, adsb: 0 };
   const active = {}, waiters = {}, nextStart = {};
   let total = 0, blocked = null, loaded = 0;
   const loadedUrls = new Set();
@@ -102,6 +103,19 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
     return launching;
   }
 
+  // adsb.lol is an open JSON API: plain HTTPS request, no browser needed
+  async function liveJson(url) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20000);
+    try {
+      const r = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'united-delay-tracker (personal, on-demand)', Accept: 'application/json' } });
+      return { status: r.status, text: await r.text(), links: [], tables: [] };
+    } catch (e) {
+      const err = new Error(`connection refused (${e.name === 'AbortError' ? 'timeout' : (e.cause && e.cause.code) || e.message})`);
+      err.refused = e.name !== 'AbortError'; throw err;
+    } finally { clearTimeout(timer); }
+  }
+
   async function live(url) {
     const ctx = await ensureBrowser();
     const page = await ctx.newPage();
@@ -122,7 +136,7 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
           : /airnavradar\.com/.test(url) || (process.env.AN_TEST_BASE_URL && url.startsWith(process.env.AN_TEST_BASE_URL)) ? 'an' : '';
         await page.waitForFunction(k => {
           const t = document.body ? document.body.innerText : '';
-          if (/captcha|verify you are human|access denied/i.test(t)) return true;
+          if (/captcha|verify you are human|verifying your browser|access denied/i.test(t)) return true;
           if (k === 'jb') return /Options from|no flights|not available/i.test(t);
           if (k === 'an') return /\bUAL\d+\b|Not found|No flights/i.test(t);
           return document.querySelector('table tr td') || /FLIGHT STATUS|Aircraft details/i.test(t);
@@ -180,7 +194,7 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
           if (mode === 'fixtures' && fixDelay) await sleep(fixDelay);
           let page;
           try {
-            page = mode === 'fixtures' ? fixture(src, url) : await live(url);
+            page = mode === 'fixtures' ? fixture(src, url) : src === 'adsb' ? await liveJson(url) : await live(url);
             checkBlocked(src, page);
           } catch (e) {
             if (!(e instanceof BlockedError) && !e.refused) throw e;           // ordinary error (e.g. timeout): just this page
