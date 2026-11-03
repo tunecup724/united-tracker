@@ -319,7 +319,25 @@ function parseAirnavAircraft(page) {
     .sort((a, b) => Date.parse(a.depIso) - Date.parse(b.depIso));
 }
 
+// ---------- adsb.lol (open ADS-B data: callsign -> registration of the plane flying it now) ----------
+// United mainline flies as UAL<n>; United Express partners fly the same number under their own
+// callsign (e.g. SkyWest UA5528 = SKW5528), so Express numbers try those prefixes too.
+const EXPRESS_PREFIXES = (process.env.FV_EXPRESS_CALLSIGNS || 'SKW,RPA,GJS,ASH,UCA,AWI').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+const adsbCallsignUrl = cs => `${base('adsb')}/v2/callsign/${cs}`;
+function adsbCallsigns(num) {
+  const n = parseInt(num, 10);
+  return n >= 3000 ? [...EXPRESS_PREFIXES.map(p => p + n), 'UAL' + n] : ['UAL' + n];
+}
+// -> { tail, type, callsign, onGround } | null
+function parseAdsb(page, callsign) {
+  let j;
+  try { j = JSON.parse(page.text || ''); } catch { return null; }
+  const a = (j.ac || []).find(x => String(x.flight || '').trim().toUpperCase() === callsign && /^N[0-9][0-9A-Z]{0,4}$/i.test(String(x.r || '')));
+  return a ? { tail: String(a.r).toUpperCase(), type: a.t || null, callsign, onGround: a.alt_baro === 'ground' } : null;
+}
+
 module.exports = {
+  adsbCallsignUrl, adsbCallsigns, parseAdsb,
   airnavFlightUrl, airnavAircraftUrl, parseAirnavRows, parseAirnavFlight, parseAirnavAircraft,
   jetblueUrl, parseJetBlue,
   fr24FlightUrl, fr24AircraftUrl, parseFr24Flight, parseFr24Aircraft,
