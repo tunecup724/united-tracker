@@ -65,6 +65,29 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
   const flightCache = new Map();           // request key -> Promise<{recKey, rec, prev} | null>
   const boardCache = new Map();            // "AP|kind" -> Promise<rows | null>
   const routeCache = new Map();
+  const adsbCache = new Map();             // airport -> Promise<Map(callsign -> plane) | null>
+
+  function adsbAround(ap) {
+    if (!adsbCache.has(ap)) adsbCache.set(ap, (async () => {
+      const url = src.adsbPointUrl(ap);
+      if (!url) return null;
+      const page = await get('adsb', url);
+      return page ? src.parseAdsbAll(page) : null;
+    })());
+    return adsbCache.get(ap);
+  }
+  // first plane found flying (or parked with transponder on) as any of these flight numbers near any of these airports
+  async function adsbFind(nums, airports) {
+    for (const ap of [...new Set(airports.filter(Boolean))]) {
+      const m = await adsbAround(ap);
+      if (!m) { if (off.has('adsb')) return null; continue; }
+      for (const num of nums) for (const cs of src.adsbCallsigns(num)) {
+        const p = m.get(cs);
+        if (p) return { ...p, num };
+      }
+    }
+    return null;
+  }
   const hubSet = new Set(cfg.hubs);
   const airportsQueued = new Set(), airportsDone = new Set(), airportsFailed = new Set(), airportsNoList = new Set();
   const seedKeys = new Set();
@@ -253,19 +276,13 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
     // ---- 1. Tail number: adsb.lol (live transponder data), AirNav, Flightradar24, then United fleet number ----
     let tailSource = null, scheduleFrom = null;
     // The late flight may not be flying yet, but the plane that will fly it usually is: on its way in
-    // (FlightView's "Aircraft's Previous Flight") or at the gate with its transponder on. Try this
-    // flight's callsign first, then the inbound flight's. The tail is confirmed on the plane's own page below.
+    // (FlightView's "Aircraft's Previous Flight") or at the gate with its transponder on. One adsb.lol
+    // request per airport lists every plane within 250 nm, so look there for this flight's callsign and
+    // the inbound flight's. The tail is confirmed on the plane's own page below.
     const adsbNums = [numOf(sr)];
     if (seed.prev && seed.prev.number && seed.prev.number !== numOf(sr)) adsbNums.push(String(seed.prev.number));
-    adsbLoop:
-    for (const num of adsbNums) {
-      for (const cs of src.adsbCallsigns(num)) {
-        const ap = await get('adsb', src.adsbCallsignUrl(cs));
-        if (ap === null && off.has('adsb')) break adsbLoop;   // switched off or refused
-        const hit = ap ? src.parseAdsb(ap, cs) : null;
-        if (hit) { tail = hit.tail; tailSource = 'adsb'; if (num !== numOf(sr)) stats.adsbViaInbound++; break adsbLoop; }
-      }
-    }
+    const hit = await adsbFind(adsbNums, [dest, origin]);
+    if (hit) { tail = hit.tail; tailSource = 'adsb'; if (hit.num !== numOf(sr)) stats.adsbViaInbound++; }
     const anf = tail ? null : await get('airnav', src.airnavFlightUrl(numOf(sr)));
     const anTail = anf ? src.parseAirnavFlight(anf, origin, depDate) : null;
     if (anTail) { tail = anTail; tailSource = 'airnav'; }
@@ -283,11 +300,15 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
       if (tailsDone.has(tail)) return;           // same plane already being followed by another task
       tailsDone.add(tail);
       for (const which of cfg.scheduleOrder) {
-        let legs = null;
-        if (which === 'flightaware') { const p = await get('flightaware', src.faHistoryUrl(tail)); legs = p ? src.parseFaHistory(p, tail) : null; }
-        else if (which === 'airnav') { const p = await get('airnav', src.airnavAircraftUrl(tail)); legs = p ? src.parseAirnavAircraft(p) : null; }
-        else if (which === 'fr24') { const p = await get('fr24', src.fr24AircraftUrl(tail)); legs = p ? src.parseFr24Aircraft(p) : null; }
-        if (!legs || !legs.length) continue;
+        let legs = null, pg = null;
+        if (which === 'flightaware') { pg = await get('flightaware', src.faHistoryUrl(tail)); legs = pg ? src.parseFaHistory(pg, tail) : null; }
+        else if (which === 'airnav') { pg = await get('airnav', src.airnavAircraftUrl(tail)); legs = pg ? src.parseAirnavAircraft(pg) : null; }
+        else if (which === 'fr24') { pg = await get('fr24', src.fr24AircraftUrl(tail)); legs = pg ? src.parseFr24Aircraft(pg) : null; }
+        if (!legs || !legs.length) {
+          const site = { fr24: 'Flightradar24', airnav: 'AirNav', flightaware: 'FlightAware' }[which];
+          if (pg) notes.push(`${site}: ${tail}'s page loaded but no flights could be read (showed: "${String(pg.text || '').replace(/\s+/g, ' ').trim().slice(0, 80)}")`);
+          continue;
+        }
         // the plane's page must contain this exact flight before its later flights are trusted
         const idx = legs.findIndex(l => l.from === origin && l.to === dest && Math.abs(ms(l.depIso) - sd) <= 90 * MIN && (!l.number || l.number === numOf(sr)));
         if (idx >= 0) { verifiedLegs = legs.slice(idx + 1); scheduleFrom = which; break; }
