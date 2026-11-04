@@ -65,7 +65,8 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
   const flightCache = new Map();           // request key -> Promise<{recKey, rec, prev} | null>
   const boardCache = new Map();            // "AP|kind" -> Promise<rows | null>
   const routeCache = new Map();
-  const adsbCache = new Map();             // airport -> Promise<Map(callsign -> plane) | null>
+  const adsbCache = new Map();
+  const unreadableNoted = {};             // airport -> Promise<Map(callsign -> plane) | null>
 
   function adsbAround(ap) {
     if (!adsbCache.has(ap)) adsbCache.set(ap, (async () => {
@@ -93,7 +94,7 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
   const seedKeys = new Set();
   const tailsDone = new Set();
   const stats = { boardRows: 0, flightsChecked: 0, confirmedCandidates: 0, longSkipped: 0, aircraftFollowed: 0,
-    aircraftNotLateEnough: 0, inboundAttached: 0, fr24Tails: 0, airnavTails: 0, adsbTails: 0, adsbViaInbound: 0, faSchedules: 0, airnavSchedules: 0, fr24Schedules: 0, tailsVerified: 0, tailsNotVerified: 0, legsLinked: 0, fallbackLinks: 0, swaps: 0, linkConflicts: 0 };
+    aircraftNotLateEnough: 0, inboundAttached: 0, fr24Tails: 0, airnavTails: 0, adsbTails: 0, adsbFound: 0, adsbFoundViaInbound: 0, faSchedules: 0, airnavSchedules: 0, fr24Schedules: 0, tailsVerified: 0, tailsNotVerified: 0, legsLinked: 0, fallbackLinks: 0, swaps: 0, linkConflicts: 0 };
 
   // ---------- page access ----------
   async function get(source, url) {
@@ -282,7 +283,7 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
     const adsbNums = [numOf(sr)];
     if (seed.prev && seed.prev.number && seed.prev.number !== numOf(sr)) adsbNums.push(String(seed.prev.number));
     const hit = await adsbFind(adsbNums, [dest, origin]);
-    if (hit) { tail = hit.tail; tailSource = 'adsb'; if (hit.num !== numOf(sr)) stats.adsbViaInbound++; }
+    if (hit) { tail = hit.tail; tailSource = 'adsb'; stats.adsbFound++; if (hit.num !== numOf(sr)) stats.adsbFoundViaInbound++; }
     const anf = tail ? null : await get('airnav', src.airnavFlightUrl(numOf(sr)));
     const anTail = anf ? src.parseAirnavFlight(anf, origin, depDate) : null;
     if (anTail) { tail = anTail; tailSource = 'airnav'; }
@@ -306,7 +307,14 @@ async function discover({ now = Date.now(), onProgress = () => {}, onUpdate = ()
         else if (which === 'fr24') { pg = await get('fr24', src.fr24AircraftUrl(tail)); legs = pg ? src.parseFr24Aircraft(pg) : null; }
         if (!legs || !legs.length) {
           const site = { fr24: 'Flightradar24', airnav: 'AirNav', flightaware: 'FlightAware' }[which];
-          if (pg) notes.push(`${site}: ${tail}'s page loaded but no flights could be read (showed: "${String(pg.text || '').replace(/\s+/g, ' ').trim().slice(0, 80)}")`);
+          if (pg && !unreadableNoted[which]) {          // one detailed note per site, to diagnose layout/blocking
+            unreadableNoted[which] = true;
+            const t = String(pg.text || '').replace(/\s+/g, ' ').trim();
+            const histLinks = (pg.links || []).filter(l => /\/history\/\d{8}\//.test(l.href || '')).length;
+            const i = t.search(/Flight Activity|History|Origin/i);
+            notes.push(`${site}: ${tail}'s page loaded but no flights could be read (HTTP ${pg.status || '?'}, ${(pg.tables || []).length} tables, ${histLinks} flight links; text: "${t.slice(Math.max(0, i), Math.max(0, i) + 120)}")`);
+          }
+          stats[`${which}Unreadable`] = (stats[`${which}Unreadable`] || 0) + (pg ? 1 : 0);
           continue;
         }
         // the plane's page must contain this exact flight before its later flights are trusted
