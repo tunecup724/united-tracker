@@ -143,23 +143,32 @@ const tailForFleet = fleet => (fleet && FLEET_TAILS[fleet]) || null;
 const faHistoryUrl = tail => `${base('flightaware')}/live/flight/${tail}/history`;
 
 // -> legs sorted by departure: [{ from, to, depIso, arrIso, status }]
+// FlightAware nests the flight list inside layout tables whose text also mentions "Origin",
+// so pick the table whose header CELLS are Date/Origin/Destination/Departure (most rows wins),
+// and read each flight's date, airports and times from its own row.
 function parseFaHistory(page, tail) {
-  const tbl = (page.tables || []).find(t => t[0] && /origin/i.test(t[0].join(' ')) && /destination/i.test(t[0].join(' ')) && /departure/i.test(t[0].join(' ')));
+  const isHead = r => { const c = (r || []).map(x => String(x).replace(/\s+/g, ' ').trim().toLowerCase());
+    return ['date', 'origin', 'destination', 'departure'].every(h => c.includes(h)); };
+  const tbl = (page.tables || []).filter(t => isHead(t[0])).sort((a, b) => b.length - a.length)[0];
   if (!tbl) return null;
-  const rowLinks = (page.links || []).map(a => a.href.match(/\/live\/flight\/[^/]+\/history\/(\d{8})\/(\d{4})Z\/([A-Z0-9]{4})\/([A-Z0-9]{4})/)).filter(Boolean);
+  const head = tbl[0].map(x => String(x).replace(/\s+/g, ' ').trim().toLowerCase());
+  const col = h => head.indexOf(h);
+  const MONS = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 };
   const legs = [];
-  tbl.slice(1).forEach((row, idx) => {
-    const lm = rowLinks[idx];
-    if (!lm || row.length < 6) return;
-    const from = icaoToIata(lm[3], row[2]);
-    const to = icaoToIata(lm[4], row[3]);
-    if (!from || !to) return;
-    const d = lm[1], hm = lm[2];
-    const depMs = Date.UTC(+d.slice(0, 4), +d.slice(4, 6) - 1, +d.slice(6, 8), +hm.slice(0, 2), +hm.slice(2, 4));
-    // arrival "07:35PM MST" is local at destination; place it on/after the departure
-    const arrIso = AIRPORT_TZ[to] ? localOnOrAfter(row[5], localDate(new Date(depMs).toISOString(), to), to, depMs) : null;
-    legs.push({ from, to, depIso: new Date(depMs).toISOString(), arrIso, status: row[6] || '' });
-  });
+  for (const row of tbl.slice(1)) {
+    const dm = String(row[col('date')] || '').match(/(\d{1,2})-([A-Za-z]{3})-(\d{4})/);
+    if (!dm || MONS[dm[2].toUpperCase()] === undefined) continue;
+    const ymd = `${dm[3]}-${String(MONS[dm[2].toUpperCase()] + 1).padStart(2, '0')}-${dm[1].padStart(2, '0')}`;
+    const code = cell => { const t = String(cell || ''); const m = t.match(/\(([A-Z0-9]{3,4})(?:\s*\/\s*([A-Z0-9]{4}))?\)/);
+      if (!m) return null; if (m[2]) return m[1]; return m[1].length === 3 ? m[1] : icaoToIata(m[1], t); };
+    const from = code(row[col('origin')]), to = code(row[col('destination')]);
+    if (!from || !to || !AIRPORT_TZ[from]) continue;
+    const depIso = fr24Time(row[col('departure')], ymd, from);
+    if (!depIso) continue;
+    const arrIso = col('arrival') >= 0 && AIRPORT_TZ[to] ? localOnOrAfter(row[col('arrival')], localDate(depIso, to), to, Date.parse(depIso)) : null;
+    const status = row[head.length - 1] || '';
+    legs.push({ from, to, depIso, arrIso, status: String(status) });
+  }
   return legs.sort((a, b) => Date.parse(a.depIso) - Date.parse(b.depIso));
 }
 
