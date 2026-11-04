@@ -142,14 +142,17 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
       if (status < 400) {
         // JetBlue's results load slowly; give them longer and wait specifically for them
         const kind = /jetblue\.com/.test(url) || (process.env.JB_TEST_BASE_URL && url.startsWith(process.env.JB_TEST_BASE_URL)) ? 'jb'
-          : /airnavradar\.com/.test(url) || (process.env.AN_TEST_BASE_URL && url.startsWith(process.env.AN_TEST_BASE_URL)) ? 'an' : '';
+          : /airnavradar\.com/.test(url) || (process.env.AN_TEST_BASE_URL && url.startsWith(process.env.AN_TEST_BASE_URL)) ? 'an'
+          : /flightaware\.com/.test(url) || (process.env.FA_TEST_BASE_URL && url.startsWith(process.env.FA_TEST_BASE_URL)) ? 'fa' : '';
         await page.waitForFunction(k => {
           const t = document.body ? document.body.innerText : '';
           if (/captcha|verify you are human|verifying your browser|access denied/i.test(t)) return true;
           if (k === 'jb') return /Options from|no flights|not available/i.test(t);
           if (k === 'an') return /\bUAL\d+\b|Not found|No flights/i.test(t);
+          // FlightAware: wait for the aircraft's flight rows themselves, not just any table on the page
+          if (k === 'fa') return !!document.querySelector('a[href*="/history/2"]') || /no (flight )?history|unknown aircraft/i.test(t);
           return document.querySelector('table tr td') || /FLIGHT STATUS|Aircraft details/i.test(t);
-        }, kind, { timeout: kind === 'jb' ? 30000 : 15000 }).catch(() => {});
+        }, kind, { timeout: kind === 'jb' ? 30000 : kind === 'fa' ? 25000 : 15000 }).catch(() => {});
       }
       return await page.evaluate(st => ({
         status: st,
