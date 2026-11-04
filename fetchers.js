@@ -77,9 +77,10 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
     active[src] = active[src] || 0; waiters[src] = waiters[src] || [];
     while (active[src] >= sp.concurrency) await new Promise(r => waiters[src].push(r));
     active[src]++;
-    if (sourceMode(src) === 'live' && sp.gapMs) {           // space page starts on each site
+    const gap = src === 'adsb' ? envInt('FV_ADSB_GAP_MS', 2000) : sp.gapMs;
+    if (sourceMode(src) === 'live' && gap) {                 // space page starts on each site
       const now = Date.now(), start = Math.max(now, nextStart[src] || 0);
-      nextStart[src] = start + sp.gapMs;
+      nextStart[src] = start + gap;
       if (start > now) await sleep(start - now);
     }
   }
@@ -105,11 +106,19 @@ function createLoader({ onPage = () => {}, maxPages = 1500 } = {}) {
 
   // adsb.lol is an open JSON API: plain HTTPS request, no browser needed
   async function liveJson(url) {
+    for (let attempt = 0; ; attempt++) {
+      const r = await liveJsonOnce(url);
+      if (r.status !== 429 || attempt >= envInt('FV_ADSB_RETRIES', 3)) return r;
+      const wait = (parseInt(r.retryAfter, 10) || 0) * 1000 || envInt('FV_ADSB_RETRY_MS', 15000) * (attempt + 1);
+      await sleep(Math.min(wait, 60000));                    // "too many requests": slow down, then try again
+    }
+  }
+  async function liveJsonOnce(url) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 20000);
     try {
       const r = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'united-delay-tracker (personal, on-demand)', Accept: 'application/json' } });
-      return { status: r.status, text: await r.text(), links: [], tables: [] };
+      return { status: r.status, retryAfter: r.headers.get('retry-after'), text: await r.text(), links: [], tables: [] };
     } catch (e) {
       const err = new Error(`connection refused (${e.name === 'AbortError' ? 'timeout' : (e.cause && e.cause.code) || e.message})`);
       err.refused = e.name !== 'AbortError'; throw err;
