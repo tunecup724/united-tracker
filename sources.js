@@ -328,6 +328,22 @@ function adsbCallsigns(num) {
   const n = parseInt(num, 10);
   return n >= 3000 ? [...EXPRESS_PREFIXES.map(p => p + n), 'UAL' + n] : ['UAL' + n];
 }
+// All aircraft within 250 nm of an airport in one request (covers every airline's callsign at once).
+function adsbPointUrl(code) {
+  const g = GEO[code];
+  return g ? `${base('adsb')}/v2/point/${g[0]}/${g[1]}/250` : null;
+}
+// -> Map(callsign -> { tail, type, callsign, onGround }) | null
+function parseAdsbAll(page) {
+  let j;
+  try { j = JSON.parse(page.text || ''); } catch { return null; }
+  const m = new Map();
+  for (const x of j.ac || []) {
+    const cs = String(x.flight || '').trim().toUpperCase();
+    if (cs && /^N[0-9][0-9A-Z]{0,4}$/i.test(String(x.r || ''))) m.set(cs, { tail: String(x.r).toUpperCase(), type: x.t || null, callsign: cs, onGround: x.alt_baro === 'ground' });
+  }
+  return m;
+}
 // -> { tail, type, callsign, onGround } | null
 function parseAdsb(page, callsign) {
   let j;
@@ -337,7 +353,7 @@ function parseAdsb(page, callsign) {
 }
 
 module.exports = {
-  adsbCallsignUrl, adsbCallsigns, parseAdsb,
+  adsbCallsignUrl, adsbCallsigns, parseAdsb, adsbPointUrl, parseAdsbAll,
   airnavFlightUrl, airnavAircraftUrl, parseAirnavRows, parseAirnavFlight, parseAirnavAircraft,
   jetblueUrl, parseJetBlue,
   fr24FlightUrl, fr24AircraftUrl, parseFr24Flight, parseFr24Aircraft,
